@@ -28,7 +28,7 @@
 //! |---|---|---|
 //! | `0x11`, `0x12` | EEG (8 ch) | 14-bit LE packed, 2 samples/ch, 0.0885 µV/LSB |
 //! | `0x47` | IMU | i16 LE, accel +0.0000610352 g/LSB, gyro −0.0074768 °/s/LSB |
-//! | `0x34`, `0x35` | Optical | 30 B (not yet decoded) |
+//! | `0x34`, `0x35` | Optical/PPG | 30 B, 20-bit LE, 3×4ch, 64 Hz |
 //! | `0x88`, `0x98` | Battery | u16 LE ÷ 512 |
 
 use crate::protocol::ATHENA_EEG_SCALE;
@@ -345,7 +345,7 @@ fn parse_uint_le_bits(data: &[u8], bit_width: usize) -> Vec<u32> {
 /// |-------------|---------|---------|----------|------------|--------|
 /// | 0x11 / 0x12 | EEG     | 28 B    | 8        | 2          | 256 Hz |
 /// | 0x47        | IMU     | 36 B    | –        | 3          | 52 Hz  |
-/// | 0x34 / 0x35 | PPG     | 30 B    | –        | 3          | 64 Hz  |
+/// | 0x34 / 0x35 | PPG     | 30 B    | 4        | 3          | 64 Hz  |
 /// | 0x88 / 0x98 | Battery | 20 B    | –        | 1          | 1 Hz   |
 ///
 /// Unknown tags advance the cursor by one byte to re-synchronise.
@@ -458,10 +458,38 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
                 idx = end;
             }
 
-            // ── Optical / PPG (skip) ──────────────────────────────────────────
+            // ── Optical / PPG ──────────────────────────────────────────────────
+            // 3 samples × 4 channels, 20-bit LE unsigned, 64 Hz.
+            // Channels: 0 = ambient, 1 = infrared, 2 = red, 3 = (unused/extra)
+            // Scale: raw / 32768 (matching TypeScript athena-parser.ts)
+            //
+            // We emit one PpgReading per channel (0..2) with 3 samples each,
+            // mirroring the Classic PPG layout.
             athena_tag::OPTICAL_4CH | athena_tag::OPTICAL_8CH => {
-                let end = payload_start + 30;
-                idx = if end > data.len() { idx + 1 } else { end };
+                const PLEN: usize = 30;
+                let end = payload_start + PLEN;
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
+                let raw = parse_uint_le_bits(&data[payload_start..end], 20);
+                // raw layout: 12 values = 3 samples × 4 channels (sample-major)
+                // raw[s*4 + ch] = sample s, channel ch
+                const NUM_SAMPLES: usize = 3;
+                const NUM_CH: usize = 4;
+                // Emit channels 0..2 (ambient, infrared, red); skip ch 3.
+                for ch in 0..NUM_CH.min(3) {
+                    let samples: Vec<u32> = (0..NUM_SAMPLES)
+                        .filter_map(|s| raw.get(s * NUM_CH + ch).copied())
+                        .collect();
+                    events.push(MuseEvent::Ppg(PpgReading {
+                        index: 0,
+                        ppg_channel: ch,
+                        timestamp: 0.0,
+                        samples,
+                    }));
+                }
+                idx = end;
             }
 
             // ── Battery ───────────────────────────────────────────────────────

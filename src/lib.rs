@@ -12,7 +12,7 @@
 //! | Muse S | Classic | 4 + AUX | ✓ | same protocol as Muse 2 |
 //! | Muse S | **Athena** | **8** | ✗† | auto-detected; different wire format |
 //!
-//! † Athena optical data is received but not yet decoded into `MuseEvent::Ppg`.
+//! † Athena optical/PPG data is decoded from 20-bit packed samples (tags 0x_4/0x_5).
 //!
 //! Firmware is detected automatically at connect time — no configuration is
 //! required.  See the [README](https://github.com/eugenehp/muse-rs#firmware-variants-classic-vs-athena)

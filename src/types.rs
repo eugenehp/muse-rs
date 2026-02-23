@@ -188,8 +188,8 @@ pub enum MuseEvent {
     Eeg(EegReading),
     /// A PPG (photoplethysmography) optical packet.
     ///
-    /// **Classic only** — requires `enable_ppg: true` in [`crate::muse_client::MuseClientConfig`].
-    /// Athena optical data is received by the firmware but not yet decoded.
+    /// Classic requires `enable_ppg: true` in [`crate::muse_client::MuseClientConfig`].
+    /// Athena optical data is always included with preset `p1045`.
     Ppg(PpgReading),
     /// Battery and housekeeping telemetry (~1 Hz).
     ///
