@@ -48,7 +48,7 @@ tui     = ["dep:ratatui", "dep:crossterm"]
 # ── Core library dependencies ─────────────────────────────────────────────────
 
 [dependencies]
-btleplug   = { git = "https://github.com/eugenehp/btleplug.git", branch = "imrpoved_mac_version" }
+btleplug   = "0.11.8"
 tokio      = { version = "1", features = ["full"] }
 uuid       = { version = "1", features = ["v4"] }
 futures    = "0.3"
@@ -62,3 +62,12 @@ anyhow     = "1"
 
 ratatui   = { version = "0.30.0", features = ["crossterm"], optional = true }
 crossterm = { version = "0.29", optional = true }
+
+# ── Patch ──────────────────────────────────────────────────────────────────────
+# Use a fork of btleplug with improved macOS disconnect handling, expanded
+# broadcast channel buffers, and null-safety fixes.  The crates.io dependency
+# above keeps `cargo publish` happy; the patch overrides it at build time.
+# See: https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version
+
+[patch.crates-io]
+btleplug = { git = "https://github.com/eugenehp/btleplug.git", branch = "imrpoved_mac_version" }
