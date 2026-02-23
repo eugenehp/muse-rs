@@ -1,6 +1,6 @@
 [package]
 name          = "muse-rs"
-version       = "0.0.1"
+version       = "0.1.0"
 edition       = "2021"
 description   = "Rust client for Muse EEG headsets over BLE using btleplug"
 keywords      = ["exg", "eeg", "ppg", "imu", "muse"]
@@ -48,7 +48,7 @@ tui     = ["dep:ratatui", "dep:crossterm"]
 # ── Core library dependencies ─────────────────────────────────────────────────
 
 [dependencies]
-btleplug   = { path = "../btleplug" }
+btleplug   = { git = "https://github.com/eugenehp/btleplug.git", branch = "imrpoved_mac_version" }
 tokio      = { version = "1", features = ["full"] }
 uuid       = { version = "1", features = ["v4"] }
 futures    = "0.3"

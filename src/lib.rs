@@ -49,10 +49,10 @@
 //! ```toml
 //! [dependencies]
 //! # Full build (includes the ratatui TUI feature):
-//! muse-rs = "0.0.1"
+//! muse-rs = "0.1.0"
 //!
 //! # Library only — skips ratatui / crossterm compilation:
-//! muse-rs = { version = "0.0.1", default-features = false }
+//! muse-rs = { version = "0.1.0", default-features = false }
 //! ```
 //!
 //! ## Module overview

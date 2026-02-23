@@ -8,11 +8,11 @@ firmware — and automatically selects the correct protocol at connection time.
 
 ## EEG view
 
-![demo](./docs/tui.png)
+![EEG view](./docs/tui.png)
 
 ## PPG view
 
-![PPG](./docs/ppg.png)
+![PPG view](./docs/ppg.png)
 
 ## Installation
 
@@ -29,10 +29,13 @@ cargo add muse-rs
 | Muse 1 (2014) | Classic | 4 | ✗ | ✗ | default |
 | Muse 2 | Classic | 4 | ✓ | ✓ | default |
 | Muse S | Classic | 4 | ✓ | ✓ | default |
-| Muse S | **Athena** | 8 | ✓ | ✗ | auto-detected |
+| Muse S | **Athena** | 4 or 8 | ✓ | ✗ | auto-detected |
 
 Athena PPG (optical) data is decoded from 20-bit LE packed samples into
 `MuseEvent::Ppg` — 3 samples per channel (ambient, infrared, red) at 64 Hz.
+
+Athena EEG supports both 4-channel (tag `0x11`, 4 samples/pkt) and 8-channel
+(tag `0x12`, 2 samples/pkt) modes depending on the preset.
 
 ---
 
@@ -47,6 +50,11 @@ and switches behaviour automatically — no configuration is required.
 At connect time, the library inspects the GATT service table.  If the
 **universal sensor characteristic** (`273e0013-…`) is present, the device is
 running Athena firmware.  Classic devices do not expose this characteristic.
+
+> **Note:** Some transitional Muse S devices (fw 3.x) expose the Athena
+> sensor characteristic but reject the Athena `dc001` data-start command
+> (rc:69).  The library automatically falls back to the Classic `d` command
+> in this case.
 
 ### Classic firmware (Muse 1, Muse 2, Muse S ≤ fw 3.x)
 
@@ -70,22 +78,41 @@ One dedicated GATT characteristic per sensor:
 
 ### Athena firmware (Muse S fw ≥ 4.x)
 
-All sensor data is **multiplexed onto one characteristic** using a tag-based
-binary framing:
+All sensor data is **multiplexed onto one characteristic** (`273e0013`) using
+a tag-based binary framing.
 
-| Sensor | Tag (lower nibble) | Payload | Rate | Format |
-|---|---|---|---|---|
-| EEG (4/8 ch) | `0x_1` / `0x_2` | 28 B | 256 Hz | 14-bit LE packed, 2 samples/ch/pkt |
-| DRL / REF | `0x_3` | 7 B | 32 Hz | 14-bit LE (not emitted as event) |
-| Optical / PPG | `0x_4` / `0x_5` | 30 B | 64 Hz | 20-bit LE, 3×4ch samples |
-| IMU (accel + gyro) | `0x_7` | 36 B | ~52 Hz | 3 × (i16 LE accel + i16 LE gyro) |
-| Battery | `0x_8` | 20 B | ~1 Hz | u16 LE fuel-gauge |
-| Control | `273e0001` | — | cmd/resp | same as Classic |
+#### Packet structure
 
-Tag bytes use the format `0xFT` where `F` = frequency-rate index (upper nibble)
-and `T` = data type (lower nibble).  The parser matches on the lower nibble
-only, so e.g. both `0x12` (256 Hz 8ch EEG) and `0x22` (128 Hz 8ch EEG) are
-recognised.
+Based on the [OpenMuse](https://github.com/DominiqueMakowski/OpenMuse)
+project's `decode.py`:
+
+```
+byte[0]      packet length
+bytes[1..9]  header (pkt_index, device clock, metadata)
+byte[9]      first subpacket tag (sensor type)
+bytes[10..13] 4-byte subpacket metadata
+bytes[14..]  first subpacket payload, then additional [TAG][META4][PAYLOAD]…
+```
+
+The first subpacket's type is given by `byte[9]`; subsequent subpackets each
+carry their own 1-byte tag + 4-byte metadata header before the payload.
+
+#### Known tags
+
+Tags use the full byte value — payload sizes depend on the specific tag, not
+just the lower nibble.
+
+| Tag  | Sensor       | Payload    | Channels | Samples/ch | Rate    |
+|------|--------------|------------|----------|------------|---------|
+| `0x11` | EEG 4ch    | 28 B       | 4        | 4          | 256 Hz  |
+| `0x12` | EEG 8ch    | 28 B       | 8        | 2          | 256 Hz  |
+| `0x34` | Optical 4ch | 30 B      | 4        | 3          | 64 Hz   |
+| `0x35` | Optical 8ch | 40 B      | 8        | 2          | 64 Hz   |
+| `0x36` | Optical 16ch| 40 B      | 16       | 1          | 64 Hz   |
+| `0x47` | IMU         | 36 B      | 6        | 3          | 52 Hz   |
+| `0x53` | DRL/REF     | 24 B      | –        | –          | 32 Hz   |
+| `0x88` | Battery (new fw) | 188–230 B | 1   | 1          | ~0.2 Hz |
+| `0x98` | Battery (old fw) | 20 B  | 1        | 1          | 1 Hz    |
 
 **EEG scale:** `µV = (raw₁₄ − 8192) × 0.0885`
 
@@ -93,31 +120,35 @@ recognised.
 (the first 4 are the standard electrode positions; indices 4–7 are extended
 channels only available on Athena hardware).
 
-**IMU:** accelerometer uses the same scale as Classic (0.0000610352 g/LSB);
-gyroscope scale is negated (−0.0074768 °/s/LSB vs. +0.0074768 for Classic).
+**IMU:** accelerometer scale = 0.0000610352 g/LSB (same as Classic);
+gyroscope scale = −0.0074768 °/s/LSB (negated vs. Classic).
 
-**Startup sequence:** `v4` → `s` → `h` → `p1045` → `dc001` × 2 → `L1` → 2 s wait
-(the 2-second wait is required by the firmware before data flows).
+**Battery:** first 2 bytes of payload = u16 LE, divide by 256.0 for percentage.
+Confirmed by matching against the `bp` field in the Athena control JSON
+response and independently verified by the
+[OpenMuse](https://github.com/DominiqueMakowski/OpenMuse) project.
 
-**Resume command:** `dc001` (not `d`).  Some transitional fw 3.x Athena
-devices reject `dc001` (rc:69); the library sends both `dc001` and `d` as
-fallback.
+**Startup sequence:** `v4` → `s` → `h` → `p1045` → `dc001` × 2 → `d` (fallback) → `L1` → 2 s wait
+
+**Resume command:** `dc001` + `d` (both sent for compatibility with fw 3.x)
 
 ### Side-by-side comparison
 
 | Property | Classic | Athena |
 |---|---|---|
 | Characteristics | one per sensor | one universal (`273e0013`) |
-| EEG channels | 4 (+ optional AUX) | 8 |
+| EEG channels | 4 (+ optional AUX) | 4 or 8 |
 | EEG bit-width | 12-bit | 14-bit |
 | EEG byte order | big-endian | little-endian |
-| EEG samples/pkt | 12 | 2 |
+| EEG samples/pkt | 12 | 2 (8ch) or 4 (4ch) |
 | EEG µV/LSB | 0.48828125 | 0.0885 |
 | IMU byte order | big-endian | little-endian |
 | Gyro sign | positive | negated |
-| Resume cmd | `d` | `dc001` (+ `d` fallback) |
-| Startup | 4 steps | 7 steps + 2 s wait |
-| PPG decoded | ✓ | ✓ (20-bit LE, 3×4ch) |
+| PPG format | 24-bit BE, 6 samp | 20-bit LE, 3×4ch |
+| Battery | u16 BE / 512 | u16 LE / 256 |
+| Resume cmd | `d` | `dc001` + `d` fallback |
+| Startup | 4 steps | 8 steps + 2 s wait |
+| PPG decoded | ✓ | ✓ |
 
 ---
 
@@ -131,10 +162,10 @@ Use `muse-rs` as a library in your own project:
 # Cargo.toml
 
 # Full build (includes TUI feature):
-muse-rs = "0.0.1"
+muse-rs = "0.1.0"
 
 # Library only — skips ratatui / crossterm compilation:
-muse-rs = { version = "0.0.1", default-features = false }
+muse-rs = { version = "0.1.0", default-features = false }
 ```
 
 ```rust
@@ -154,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(event) = rx.recv().await {
         match event {
             MuseEvent::Eeg(r) => println!("ch{} sample[0]: {:.2} µV", r.electrode, r.samples[0]),
+            MuseEvent::Ppg(r) => println!("ppg ch{}: {:?}", r.ppg_channel, r.samples),
             MuseEvent::Disconnected => break,
             _ => {}
         }
@@ -167,14 +199,14 @@ async fn main() -> anyhow::Result<()> {
 | `MuseEvent` variant | Muse 1 | Muse 2 | Muse S Classic | Muse S Athena |
 |---|---|---|---|---|
 | `Eeg` (4 ch) | ✓ | ✓ | ✓ | ✓ (ch 0–3) |
-| `Eeg` (ch 4–7, Athena-only) | ✗ | ✗ | ✗ | ✓ |
+| `Eeg` (ch 4–7, Athena-only) | ✗ | ✗ | ✗ | ✓ (8ch mode) |
 | `Accelerometer` | ✓ | ✓ | ✓ | ✓ |
 | `Gyroscope` | ✓ | ✓ | ✓ | ✓ |
 | `Telemetry` (battery) | ✓ | ✓ | ✓ | ✓ |
 | `Ppg` | ✗ | ✓\* | ✓\* | ✓ |
 | `Control` | ✓ | ✓ | ✓ | ✓ |
 
-\* Classic requires `enable_ppg: true` in `MuseClientConfig`.  
+\* Classic requires `enable_ppg: true` in `MuseClientConfig`.
 Athena always includes PPG with preset `p1045`.
 
 ---
@@ -224,6 +256,14 @@ allow-list, then re-run.
 > sure Bluetooth is enabled (`System Settings → Bluetooth`) and the headset
 > is powered on.  Press **[s]** in the TUI to trigger a fresh scan at any time.
 
+### macOS — BLE disconnect detection
+
+This project uses a [fork of btleplug](https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version)
+with improved macOS support, including reliable disconnect detection via
+`CentralEvent::DeviceDisconnected`, expanded broadcast channel buffers, and
+null-safety improvements that prevent hangs when a peripheral becomes
+unreachable.
+
 ---
 
 ## Build
@@ -243,7 +283,7 @@ cargo run --bin tui                # scan → auto-connect to first found device
 cargo run --bin tui -- --simulate  # built-in EEG simulator (no hardware needed)
 ```
 
-### What you see
+### EEG view (default)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -263,13 +303,32 @@ cargo run --bin tui -- --simulate  # built-in EEG simulator (no hardware needed)
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### PPG view (press `2`)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  MUSE EEG Monitor  │  ● Muse-AB12  │  PPG  │  Bat 85%  │  21.3 pkt/s  │  auto  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Ambient   min:12400  max:13200                                [SMOOTH]        │
+│ ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿  3 optical channels, auto-scaled Y axis                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Infrared  ...                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Red       ...                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ [Tab]Devices [1]EEG [2]PPG [d]Disconnect [+/-]Scale [a]Auto [v]Smooth         │
+│ Accel x:+0.010g  y:+0.020g  z:-1.000g   Gyro x:+0.120°/s  …                  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 Each panel shows a rolling **2-second window** rendered with Braille markers
-(~4× the resolution of block characters).  The border turns **red** when any
-sample in the buffer exceeds the current Y-axis scale.
+(~4× the resolution of block characters).  EEG borders turn **red** when any
+sample exceeds the current Y-axis scale.  PPG uses auto-scaling Y axis that
+adapts to the data range with 5% margin.
 
 **Smooth mode** (on by default, toggle with `v`): draws the raw signal in a
 dim colour as background context, then overlays a 9-sample moving-average
-(≈ 35 ms at 256 Hz) in the full channel colour.
+(≈ 35 ms at 256 Hz / ≈ 140 ms at 64 Hz) in the full channel colour.
 
 > **Scale note**: the TUI starts at **±500 µV** for real devices — wide enough
 > to capture typical artefacts on first connect.  The simulator starts at
@@ -297,13 +356,13 @@ advertising).
 | Key | Context | Action |
 |---|---|---|
 | `Tab` | streaming | open device picker |
-| `1` | streaming | switch to EEG view |
-| `2` | streaming | switch to PPG view |
+| `1` | streaming | switch to EEG view (4 channels) |
+| `2` | streaming | switch to PPG view (3 optical channels) |
 | `s` | streaming / picker | rescan for Muse devices |
 | `d` | streaming | disconnect and rescan |
-| `+` / `=` | streaming | zoom out (increase µV scale, EEG only) |
-| `-` | streaming | zoom in (decrease µV scale, EEG only) |
-| `a` | streaming | auto-scale to current peak (EEG only) |
+| `+` / `=` | EEG view | zoom out (increase µV scale) |
+| `-` | EEG view | zoom in (decrease µV scale) |
+| `a` | EEG view | auto-scale to current peak |
 | `v` | streaming | toggle smooth overlay |
 | `p` | streaming | pause streaming |
 | `r` | streaming | resume streaming |
@@ -339,6 +398,7 @@ cargo run --release
 
 Scans up to 15 seconds, connects to the first Muse found, and streams all
 decoded events to stdout.  Works with both Classic and Athena firmware.
+PPG streaming is enabled by default.
 
 ### Interactive commands (type + Enter)
 
@@ -357,6 +417,14 @@ RUST_LOG=debug cargo run
 RUST_LOG=muse_rs=debug cargo run   # library logs only
 ```
 
+The TUI writes logs to `muse-tui.log` in the current directory (never to
+stderr, which would corrupt the alternate-screen display):
+
+```bash
+RUST_LOG=debug cargo run --bin tui
+cat muse-tui.log
+```
+
 ---
 
 ## Configuration
@@ -364,7 +432,7 @@ RUST_LOG=muse_rs=debug cargo run   # library logs only
 ```rust
 let config = MuseClientConfig {
     enable_aux:        false,   // subscribe to EEG AUX channel (Classic only)
-    enable_ppg:        false,   // subscribe to PPG channels (Classic only)
+    enable_ppg:        true,    // subscribe to PPG channels (Classic only)
     scan_timeout_secs: 15,      // abort scan after this many seconds
     name_prefix:       "Muse".into(), // match devices whose name starts with this
 };
@@ -386,16 +454,21 @@ let config = MuseClientConfig {
 ```
 muse-rs/
 ├── Cargo.toml
+├── build.rs             # macOS Info.plist embedding for CoreBluetooth
+├── Info.plist           # NSBluetoothAlwaysUsageDescription
 └── src/
     ├── lib.rs           # Crate root: module declarations + prelude
     ├── main.rs          # Headless CLI binary (cargo run)
     ├── bin/
     │   └── tui.rs       # Full-screen TUI binary (cargo run --bin tui)
+    │                    # EEG + PPG views, device picker, smooth overlay
     ├── muse_client.rs   # MuseClient (scan/connect) + MuseHandle (commands)
     │                    # Firmware detection + dual protocol dispatch
+    │                    # BLE disconnect detection (adapter event stream)
     ├── protocol.rs      # GATT UUIDs, sampling constants, encode/decode helpers
     ├── parse.rs         # Classic decoders (12-bit EEG, 24-bit PPG, BE IMU)
-    │                    # Athena decoder (14-bit LE EEG, tag-based framing)
+    │                    # Athena decoder (tag-based: EEG, PPG, IMU, battery)
+    │                    # ControlAccumulator (JSON fragment reassembly)
     └── types.rs         # EegReading, PpgReading, ImuData, MuseEvent, …
 ```
 
@@ -424,9 +497,11 @@ sample = ((byte[1] & 0xF) << 8) | byte[2]         // odd samples
 
 ### Athena EEG decoding
 
-Each notification: 9-byte header + tag-based entries.  EEG payload (28 bytes):
-14-bit little-endian integers packed LSB-first, channel-major layout
-(ch0\_s0, ch0\_s1, ch1\_s0, … ch7\_s1 = 16 values):
+Each notification: 14-byte header + tag-based entries.  EEG payload (28 bytes):
+14-bit little-endian integers packed LSB-first, sample-major layout.
+
+For 8ch mode (tag `0x12`): 2 samples × 8 channels = 16 values.
+For 4ch mode (tag `0x11`): 4 samples × 4 channels = 16 values.
 
 ```
 µV = (raw₁₄ − 8192) × 0.0885
@@ -434,19 +509,32 @@ Each notification: 9-byte header + tag-based entries.  EEG payload (28 bytes):
 
 ### PPG decoding
 
-**Classic:** six 24-bit big-endian integers per notification:
+**Classic:** six 24-bit big-endian unsigned integers per notification:
 
 ```
 value = (b0 << 16) | (b1 << 8) | b2
 ```
 
-**Athena:** 30-byte payload, 12 × 20-bit LE unsigned integers (3 samples × 4
-channels, sample-major layout).  Channels 0–2 = ambient, infrared, red:
+**Athena (tag `0x34`, 4-channel):** 30-byte payload, 12 × 20-bit LE unsigned
+integers (3 samples × 4 channels, sample-major layout).
+Channels 0–2 = ambient, infrared, red:
 
 ```
 raw = parseUintLE(payload, 20)    // 12 values
 ch_samples[ch][s] = raw[s * 4 + ch]
 ```
+
+**Athena (tag `0x35`, 8-channel):** 40-byte payload, 16 × 20-bit LE unsigned
+integers (2 samples × 8 channels).
+
+### Battery decoding
+
+**Classic:** `battery_level = u16_BE / 512.0`
+
+**Athena:** First 2 bytes of battery payload: `battery_level = u16_LE / 256.0`.
+Tag `0x98` (old fw) has a fixed 20-byte payload; tag `0x88` (new fw) has a
+variable-length payload (188–230 bytes) — the parser consumes to the packet
+boundary using `byte[0]` (pkt\_len).
 
 ### Timestamp reconstruction (Classic only)
 
@@ -458,18 +546,70 @@ wrap-around (0xFFFF → 0x0000) is handled automatically.
 Athena notifications do not carry a per-channel index; timestamps are not
 reconstructed for Athena EEG packets (`timestamp` field is always `0.0`).
 
+### Control JSON reassembly
+
+Both firmwares send JSON responses as length-prefixed fragments split across
+multiple BLE notifications.  The `ControlAccumulator` in `parse.rs` tracks
+brace nesting depth to reassemble complete JSON objects from the fragment
+stream, handling nested objects and fragments that split mid-token.
+
+---
+
+## Dependencies
+
+| Crate | Purpose |
+|---|---|
+| [btleplug](https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version) | Cross-platform BLE (forked for improved macOS support) |
+| [tokio](https://tokio.rs) | Async runtime |
+| [ratatui](https://ratatui.rs) | Terminal UI framework (optional, `tui` feature) |
+| [crossterm](https://github.com/crossterm-rs/crossterm) | Terminal backend (optional, `tui` feature) |
+
 ---
 
 ## References
 
-* [muse-jsx](../muse-jsx) – TypeScript reference implementation (Web Bluetooth)
-* [btleplug](https://github.com/deviceplug/btleplug) – Cross-platform BLE library for Rust
-* [urish/muse-js](https://github.com/urish/muse-js) – Original muse-js
+* [OpenMuse](https://github.com/DominiqueMakowski/OpenMuse) — Python Muse S / Athena decoder; used as reference for tag-based packet structure, payload sizes, battery decoding, and EEG/optical channel layouts
+* [muse-jsx](https://github.com/eugenehp/muse-jsx) — TypeScript reference implementation (Web Bluetooth); basis for the Athena startup sequence and `parsePacket()` tag decoder
+* [btleplug](https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version) — Cross-platform BLE library for Rust (fork with improved macOS disconnect handling)
+* [urish/muse-js](https://github.com/urish/muse-js) — Original muse-js library by Uri Shaked
+* [Interaxon Muse](https://choosemuse.com/) — Official Muse headset manufacturer
+
+---
+
+## Citation
+
+If you use `muse-rs` in academic research or published work, please cite it as:
+
+### BibTeX
+
+```bibtex
+@software{hauptmann2026musers,
+  author       = {Hauptmann, Eugene},
+  title        = {muse-rs: Rust Library and TUI for Muse EEG Headsets},
+  year         = {2026},
+  url          = {https://github.com/eugenehp/muse-rs},
+  version      = {0.1.0},
+  description  = {Async Rust library and terminal UI for streaming real-time
+                  EEG, PPG, IMU, and battery data from Interaxon Muse headsets
+                  over Bluetooth Low Energy. Supports Classic and Athena
+                  firmware with automatic protocol detection.},
+}
+```
+
+### APA
+
+> Hauptmann, E. (2026). *muse-rs: Rust Library and TUI for Muse EEG Headsets* (Version 0.1.0) [Computer software]. https://github.com/eugenehp/muse-rs
+
+### IEEE
+
+> E. Hauptmann, "muse-rs: Rust Library and TUI for Muse EEG Headsets," 2026. [Online]. Available: https://github.com/eugenehp/muse-rs
+
+---
 
 ## License
 
-[Apache-2.0](/LICENSE)
+[Apache-2.0](./LICENSE)
 
-## Copyright 
+## Copyright
 
-2026, [Eugene Hauptmann](github.com/eugenehp)
+© 2026, [Eugene Hauptmann](https://github.com/eugenehp)

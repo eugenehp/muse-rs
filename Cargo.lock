@@ -182,6 +182,7 @@ dependencies = [
 [[package]]
 name = "btleplug"
 version = "0.11.8"
+source = "git+https://github.com/eugenehp/btleplug.git?branch=imrpoved_mac_version#c6055fe0e7b40c771a8b6d6c7548f00276a41d36"
 dependencies = [
  "async-trait",
  "bitflags 2.11.0",
@@ -1034,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "muse-rs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "btleplug",
