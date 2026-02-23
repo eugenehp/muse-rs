@@ -48,7 +48,7 @@ tui     = ["dep:ratatui", "dep:crossterm"]
 # ── Core library dependencies ─────────────────────────────────────────────────
 
 [dependencies]
-btleplug   = "0.11"
+btleplug   = { path = "../btleplug" }
 tokio      = { version = "1", features = ["full"] }
 uuid       = { version = "1", features = ["v4"] }
 futures    = "0.3"

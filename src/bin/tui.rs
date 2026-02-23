@@ -417,14 +417,32 @@ fn spawn_simulator(app: Arc<Mutex<App>>) {
 /// The task has a hard deadline of `scan_timeout + 10 s` to guard against
 /// `Manager::new()` or `adapter.start_scan()` hanging indefinitely inside
 /// btleplug when the Bluetooth stack is in a bad state.
-fn start_scan(config: MuseClientConfig) -> oneshot::Receiver<Vec<MuseDevice>> {
+/// Scan result delivered through the oneshot channel.
+struct ScanResult {
+    devices: Vec<MuseDevice>,
+    /// `Some(msg)` when the scan failed or timed out.
+    error: Option<String>,
+}
+
+fn start_scan(config: MuseClientConfig) -> oneshot::Receiver<ScanResult> {
     let (tx, rx) = oneshot::channel();
     let deadline = Duration::from_secs(config.scan_timeout_secs + 10);
     tokio::spawn(async move {
-        let result = tokio::time::timeout(deadline, MuseClient::new(config).scan_all())
-            .await
-            .unwrap_or(Ok(vec![]))   // timed out → treat as empty scan
-            .unwrap_or_default();    // error     → treat as empty scan
+        let result = match tokio::time::timeout(deadline, MuseClient::new(config).scan_all()).await
+        {
+            Ok(Ok(devices)) => {
+                log::info!("Scan completed: {} device(s) found", devices.len());
+                ScanResult { devices, error: None }
+            }
+            Ok(Err(e)) => {
+                log::error!("Scan failed: {e}");
+                ScanResult { devices: vec![], error: Some(format!("{e}")) }
+            }
+            Err(_) => {
+                log::error!("Scan timed out after {deadline:?}");
+                ScanResult { devices: vec![], error: Some("scan timed out".into()) }
+            }
+        };
         let _ = tx.send(result);
     });
     rx
@@ -441,7 +459,7 @@ fn start_scan(config: MuseClientConfig) -> oneshot::Receiver<Vec<MuseDevice>> {
 ///   • A new scan is queued after `delay_secs` (gives BLE stack time to settle)
 fn restart_scan(
     app: &Arc<Mutex<App>>,
-    pending_scan: &mut Option<oneshot::Receiver<Vec<MuseDevice>>>,
+    pending_scan: &mut Option<oneshot::Receiver<ScanResult>>,
     retry_at: &mut Option<tokio::time::Instant>,
     delay_secs: u64,
 ) {
@@ -873,12 +891,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // Second row: macOS permission hint when waiting for devices, else IMU.
     let second_line = match &app.mode {
         AppMode::NoDevices => {
-            let hint = if cfg!(target_os = "macos") {
-                " No Muse found. On macOS grant Bluetooth access: System Settings → Privacy & Security → Bluetooth. Retrying…"
+            let base = if cfg!(target_os = "macos") {
+                " No Muse found. On macOS grant Bluetooth access: System Settings → Privacy & Security → Bluetooth."
             } else {
-                " No Muse found. Make sure the headset is powered on and in range. Retrying…"
+                " No Muse found. Make sure the headset is powered on and in range."
             };
-            Line::from(Span::styled(hint, Style::default().fg(Color::Yellow)))
+            let detail = app
+                .last_error
+                .as_deref()
+                .map(|e| format!(" Error: {e}"))
+                .unwrap_or_default();
+            Line::from(Span::styled(
+                format!("{base}{detail} Retrying…"),
+                Style::default().fg(Color::Yellow),
+            ))
         }
         _ => {
             let (ax, ay, az) = app.accel.unwrap_or((0.0, 0.0, 0.0));
@@ -1044,6 +1070,20 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // ── Logging ─────────────────────────────────────────────────────────────
+    // Write logs to a file so they never interfere with the TUI display.
+    // Set RUST_LOG=debug for verbose BLE diagnostics, e.g.:
+    //   RUST_LOG=debug cargo run --bin tui
+    // Logs are written to muse-tui.log in the current directory.
+    {
+        use std::fs::File;
+        if let Ok(file) = File::create("muse-tui.log") {
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .init();
+        }
+    }
+
     let simulate = std::env::args().any(|a| a == "--simulate");
 
     // ── Shared UI state ───────────────────────────────────────────────────────
@@ -1055,7 +1095,7 @@ async fn main() -> Result<()> {
     let mut handle: Option<Arc<MuseHandle>> = None;
 
     // Oneshot receiver for the current background scan task.
-    let mut pending_scan: Option<oneshot::Receiver<Vec<MuseDevice>>> = None;
+    let mut pending_scan: Option<oneshot::Receiver<ScanResult>> = None;
     // Oneshot receiver for the current background connect task.
     let mut pending_connect: Option<oneshot::Receiver<Option<ConnectOutcome>>> = None;
     // Instant at which the next automatic retry scan should start.
@@ -1091,9 +1131,9 @@ async fn main() -> Result<()> {
     'main: loop {
         // ── 1. Collect finished scan results ─────────────────────────────────
         if let Some(ref mut rx) = pending_scan {
-            if let Ok(found) = rx.try_recv() {
+            if let Ok(scan_result) = rx.try_recv() {
                 pending_scan = None;
-                devices = found;
+                devices = scan_result.devices;
 
                 {
                     let mut s = app.lock().unwrap();
@@ -1101,6 +1141,9 @@ async fn main() -> Result<()> {
                     s.picker_scanning = false;
                     if devices.is_empty() {
                         s.mode = AppMode::NoDevices;
+                        if let Some(err) = scan_result.error {
+                            s.last_error = Some(err);
+                        }
                     }
                 }
 

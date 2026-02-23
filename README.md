@@ -8,6 +8,12 @@ firmware — and automatically selects the correct protocol at connection time.
 
 ![demo](/docs/tui.png)
 
+## Installation
+
+```shell
+cargo add muse-rs
+```
+
 ---
 
 ## Supported hardware

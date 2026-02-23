@@ -231,10 +231,13 @@ pub fn parse_ppg_reading(data: &[u8], ppg_channel: usize, timestamp: f64) -> Opt
 /// assert_eq!(json, r#"{"fw":"3.4.5"}"#);
 /// ```
 ///
-/// A new `{` resets the buffer, so stale partial data from an earlier packet
-/// is discarded automatically.
+/// Nested braces are tracked correctly, and characters before the first `{`
+/// are discarded so stale data from a previous notification cannot corrupt
+/// the next object.
 pub struct ControlAccumulator {
     buffer: String,
+    /// Brace nesting depth.  Becomes 1 on `{`, returns to 0 on the matching `}`.
+    depth: usize,
 }
 
 impl ControlAccumulator {
@@ -242,25 +245,45 @@ impl ControlAccumulator {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
+            depth: 0,
         }
     }
 
     /// Append a decoded fragment to the internal buffer.
     ///
-    /// Returns the complete JSON string when a closing `}` is encountered,
-    /// otherwise returns `None`.  The buffer is cleared after a complete
-    /// object is returned.
+    /// Returns the complete JSON string when the top-level closing `}` is
+    /// encountered (depth returns to 0), otherwise returns `None`.
+    /// The buffer is cleared after a complete object is returned.
+    ///
+    /// Characters received before the first `{` are silently discarded so
+    /// that stale trailing data from a previous notification cannot corrupt
+    /// the next object.
     pub fn push(&mut self, fragment: &str) -> Option<String> {
         for ch in fragment.chars() {
-            // A new `{` always starts a fresh object; discard any partial state.
             if ch == '{' {
-                self.buffer.clear();
-            }
-            self.buffer.push(ch);
-            if ch == '}' {
-                let json = self.buffer.clone();
-                self.buffer.clear();
-                return Some(json);
+                if self.depth == 0 {
+                    // Starting a new top-level object — discard any garbage
+                    // that accumulated before this opening brace.
+                    self.buffer.clear();
+                }
+                self.depth += 1;
+                self.buffer.push(ch);
+            } else if ch == '}' {
+                if self.depth > 0 {
+                    self.buffer.push(ch);
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        let json = self.buffer.clone();
+                        self.buffer.clear();
+                        return Some(json);
+                    }
+                }
+                // else: stray '}' before any '{' — ignore
+            } else {
+                // Only accumulate characters while inside a top-level object.
+                if self.depth > 0 {
+                    self.buffer.push(ch);
+                }
             }
         }
         None
@@ -326,6 +349,22 @@ fn parse_uint_le_bits(data: &[u8], bit_width: usize) -> Vec<u32> {
 /// | 0x88 / 0x98 | Battery | 20 B    | –        | 1          | 1 Hz   |
 ///
 /// Unknown tags advance the cursor by one byte to re-synchronise.
+/// Athena tag data-type codes (lower 4 bits of the tag byte).
+///
+/// The upper 4 bits encode the sampling-rate index (see `ATHENA_FREQ_MAP`
+/// in the TypeScript `athena-parser.ts`); only the lower nibble determines
+/// the payload format.
+mod athena_tag {
+    pub const EEG_4CH: u8 = 0x1;
+    pub const EEG_8CH: u8 = 0x2;
+    pub const DRL_REF: u8 = 0x3;
+    pub const OPTICAL_4CH: u8 = 0x4;
+    pub const OPTICAL_8CH: u8 = 0x5;
+    // 0x6 = OPTICAL_16CH (unused)
+    pub const IMU: u8 = 0x7;
+    pub const BATTERY: u8 = 0x8;
+}
+
 pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
     const HEADER: usize = 9;
     const META: usize = 4; // opaque metadata bytes between tag and payload
@@ -339,14 +378,14 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
 
     while idx < data.len() {
         let tag = data[idx];
+        let tag_type = tag & 0x0F; // lower nibble = data type
         let payload_start = idx + 1 + META;
 
-        match tag {
-            // ── EEG ───────────────────────────────────────────────────────────
-            // 8 channels × 2 samples, 14-bit LE unsigned, channel-major layout.
-            // Raw layout: [ch0_s0, ch0_s1, ch1_s0, ch1_s1, … ch7_s0, ch7_s1]
+        match tag_type {
+            // ── EEG (4-ch or 8-ch) ───────────────────────────────────────────
+            // 14-bit LE unsigned, channel-major layout.
             // Scale: (raw − 8192) × 0.0885 µV
-            0x11 | 0x12 => {
+            athena_tag::EEG_4CH | athena_tag::EEG_8CH => {
                 const PLEN: usize = 28;
                 let end = payload_start + PLEN;
                 if end > data.len() {
@@ -354,7 +393,6 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
                     continue;
                 }
                 let raw = parse_uint_le_bits(&data[payload_start..end], 14);
-                // 28 × 8 / 14 = 16 values → 8 ch × 2 samples
                 const SAMPLES_PER_CH: usize = 2;
                 let num_ch = raw.len() / SAMPLES_PER_CH;
                 for ch in 0..num_ch {
@@ -373,11 +411,18 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
                 idx = end;
             }
 
+            // ── DRL / REF ─────────────────────────────────────────────────────
+            // 7-byte payload, 14-bit LE unsigned.  Parsed but not emitted as a
+            // MuseEvent yet — just advance the cursor to stay in sync.
+            athena_tag::DRL_REF => {
+                const PLEN: usize = 7;
+                let end = payload_start + PLEN;
+                idx = if end > data.len() { idx + 1 } else { end };
+            }
+
             // ── IMU ───────────────────────────────────────────────────────────
             // 3 samples × (ACC[3] + GYRO[3]), 16-bit LE signed.
-            // ACC scale: ±2 G / 32768 ≈ 0.0000610352 G/LSB
-            // GYRO scale: ±250 dps / 32768, negated per muse-athena.ts ≈ -0.0074768 °/s/LSB
-            0x47 => {
+            athena_tag::IMU => {
                 const PLEN: usize = 36;
                 let end = payload_start + PLEN;
                 if end > data.len() {
@@ -388,7 +433,6 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
                     .chunks_exact(2)
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
-                // Emit one sample set (first of the 3 in the packet).
                 if vals.len() >= 6 {
                     const AS: f32 = 0.0000610352;
                     const GS: f32 = -0.0074768;
@@ -415,18 +459,13 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             }
 
             // ── Optical / PPG (skip) ──────────────────────────────────────────
-            // Optical data is received but not yet decoded into MuseEvent::Ppg.
-            // The 30-byte payload is skipped to keep the cursor in sync.
-            0x34 | 0x35 => {
+            athena_tag::OPTICAL_4CH | athena_tag::OPTICAL_8CH => {
                 let end = payload_start + 30;
                 idx = if end > data.len() { idx + 1 } else { end };
             }
 
             // ── Battery ───────────────────────────────────────────────────────
-            // 20-byte payload = 10 × uint16 LE.
-            // values[0] is the raw fuel-gauge reading; same divisor (512) as
-            // classic Muse telemetry works well in practice.
-            0x88 | 0x98 => {
+            athena_tag::BATTERY => {
                 const PLEN: usize = 20;
                 let end = payload_start + PLEN;
                 if end > data.len() {
@@ -449,6 +488,7 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
 
             // ── Unknown tag: advance one byte to stay in sync ─────────────────
             _ => {
+                log::debug!("Athena: unknown tag 0x{tag:02x} (type=0x{tag_type:x}) at offset {idx}");
                 idx += 1;
             }
         }
