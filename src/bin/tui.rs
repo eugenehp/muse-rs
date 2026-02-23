@@ -7,10 +7,12 @@
 //! Keys (streaming view)
 //! ---------------------
 //!   Tab      open device picker
+//!   1        switch to EEG view
+//!   2        switch to PPG view
 //!   s        trigger a fresh BLE scan right now
-//!   +  / =   zoom out  (increase µV scale)
-//!   -        zoom in   (decrease µV scale)
-//!   a        auto-scale: fit Y axis to current peak amplitude
+//!   +  / =   zoom out  (increase µV scale, EEG only)
+//!   -        zoom in   (decrease µV scale, EEG only)
+//!   a        auto-scale: fit Y axis to current peak amplitude (EEG only)
 //!   v        toggle smooth overlay (dim raw + bright 9-pt moving-average)
 //!   p        pause streaming   (sends 'h' to real device)
 //!   r        resume streaming  (sends 'd' to real device)
@@ -72,6 +74,21 @@ const BUF_SIZE: usize = (WINDOW_SECS * EEG_HZ) as usize; // 512
 /// The optional AUX channel (index 4) is not shown in the TUI.
 const NUM_CH: usize = 4;
 
+/// PPG sample rate (Hz). Athena optical data arrives at 64 Hz.
+const PPG_HZ: f64 = 64.0;
+
+/// Number of PPG samples retained per channel — enough for `WINDOW_SECS`.
+const PPG_BUF_SIZE: usize = (WINDOW_SECS * PPG_HZ) as usize; // 128
+
+/// Number of PPG optical channels: ambient, infrared, red.
+const PPG_NUM_CH: usize = 3;
+
+/// PPG channel display names.
+const PPG_CHANNEL_NAMES: [&str; 3] = ["Ambient", "Infrared", "Red"];
+
+/// PPG channel colours.
+const PPG_COLORS: [Color; 3] = [Color::LightBlue, Color::LightRed, Color::Red];
+
 /// Discrete Y-axis scale steps in µV (half the full symmetric range ±scale).
 /// The user cycles through these with `+` / `-`; `a` picks the best fit automatically.
 const Y_SCALES: &[f64] = &[10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0];
@@ -127,9 +144,22 @@ pub enum AppMode {
 
 // ── App state (shared with the BLE event task via Arc<Mutex<_>>) ──────────────
 
+/// Which signal type is shown in the main chart area.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Eeg,
+    Ppg,
+}
+
 pub struct App {
     // ── EEG data
     bufs: [VecDeque<f64>; NUM_CH],
+
+    // ── PPG data (raw ADC u32 stored as f64 for chart compatibility)
+    ppg_bufs: [VecDeque<f64>; PPG_NUM_CH],
+
+    // ── Which signal type is displayed
+    pub view: ViewMode,
 
     // ── Status
     pub mode: AppMode,
@@ -167,6 +197,8 @@ impl App {
     fn new() -> Self {
         Self {
             bufs: std::array::from_fn(|_| VecDeque::with_capacity(BUF_SIZE + 16)),
+            ppg_bufs: std::array::from_fn(|_| VecDeque::with_capacity(PPG_BUF_SIZE + 16)),
+            view: ViewMode::Eeg,
             mode: AppMode::Scanning,
             battery: None,
             accel: None,
@@ -206,7 +238,6 @@ impl App {
             self.total_samples += samples.len() as u64;
             let now = Instant::now();
             self.pkt_times.push_back(now);
-            // Keep only arrival times from the last 2 seconds for rate computation.
             while self
                 .pkt_times
                 .front()
@@ -218,6 +249,20 @@ impl App {
         }
     }
 
+    /// Append raw PPG ADC samples to the rolling ring-buffer for channel `ch`.
+    pub fn push_ppg(&mut self, ch: usize, samples: &[u32]) {
+        if self.paused || ch >= PPG_NUM_CH {
+            return;
+        }
+        let buf = &mut self.ppg_bufs[ch];
+        for &v in samples {
+            buf.push_back(v as f64);
+            while buf.len() > PPG_BUF_SIZE {
+                buf.pop_front();
+            }
+        }
+    }
+
     /// Wipe all EEG buffers and reset transient sensor readings.
     ///
     /// Called when disconnecting or reconnecting so the charts start blank.
@@ -225,6 +270,9 @@ impl App {
     /// are managed by the caller.
     pub fn clear(&mut self) {
         for b in &mut self.bufs {
+            b.clear();
+        }
+        for b in &mut self.ppg_bufs {
             b.clear();
         }
         self.total_samples = 0;
@@ -496,6 +544,9 @@ fn spawn_event_task(mut rx: tokio::sync::mpsc::Receiver<MuseEvent>, app: Arc<Mut
                 MuseEvent::Eeg(r) if r.electrode < NUM_CH => {
                     s.push(r.electrode, &r.samples);
                 }
+                MuseEvent::Ppg(r) if r.ppg_channel < PPG_NUM_CH => {
+                    s.push_ppg(r.ppg_channel, &r.samples);
+                }
                 MuseEvent::Telemetry(t) => {
                     s.battery = Some(t.battery_level);
                 }
@@ -663,7 +714,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "Bat N/A".into());
 
     let rate = format!("{:.1} pkt/s", app.pkt_rate());
-    let scale = format!("±{:.0} µV", app.y_range());
+    let scale = match app.view {
+        ViewMode::Eeg => format!("±{:.0} µV", app.y_range()),
+        ViewMode::Ppg => "auto".to_string(),
+    };
+    let view_label = match app.view {
+        ViewMode::Eeg => "EEG",
+        ViewMode::Ppg => "PPG",
+    };
     let total = format!("{}K smp", app.total_samples / 1_000);
 
     let line = Line::from(vec![
@@ -673,6 +731,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         sep(),
         Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        sep(),
+        Span::styled(
+            view_label,
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         sep(),
         Span::styled(bat, Style::default().fg(Color::White)),
         sep(),
@@ -703,12 +768,16 @@ fn sep<'a>() -> Span<'a> {
 
 // ── EEG charts ────────────────────────────────────────────────────────────────
 
-/// Render the four EEG waveform charts stacked vertically.
-///
-/// Converts each channel's ring-buffer into `(time_s, µV)` point pairs,
-/// clamps them to the current Y window (to prevent ratatui from discarding
-/// out-of-range points), and dispatches one [`draw_channel`] call per row.
+/// Render the waveform charts (EEG or PPG depending on `app.view`).
 fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
+    match app.view {
+        ViewMode::Eeg => draw_eeg_charts(frame, area, app),
+        ViewMode::Ppg => draw_ppg_charts(frame, area, app),
+    }
+}
+
+/// Render the four EEG waveform charts stacked vertically.
+fn draw_eeg_charts(frame: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::vertical([
         Constraint::Ratio(1, 4),
         Constraint::Ratio(1, 4),
@@ -723,10 +792,6 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
             app.bufs[ch]
                 .iter()
                 .enumerate()
-                // Clamp to the visible Y window so every sample stays on-screen.
-                // Without clamping, ratatui silently drops out-of-range points and
-                // the waveform breaks into isolated dots wherever the signal
-                // exceeds the axis bounds (common with Athena high-amplitude data).
                 .map(|(i, &v)| (i as f64 / EEG_HZ, v.clamp(-y_range, y_range)))
                 .collect()
         })
@@ -735,6 +800,119 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
     for ch in 0..NUM_CH {
         draw_channel(frame, rows[ch], ch, &data[ch], app);
     }
+}
+
+/// Render the three PPG optical channel charts stacked vertically.
+fn draw_ppg_charts(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::vertical([
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+    ])
+    .split(area);
+
+    for ch in 0..PPG_NUM_CH {
+        draw_ppg_channel(frame, rows[ch], ch, app);
+    }
+}
+
+/// Render a single PPG channel chart.
+fn draw_ppg_channel(frame: &mut Frame, area: Rect, ch: usize, app: &App) {
+    let color = PPG_COLORS[ch];
+    let name = PPG_CHANNEL_NAMES[ch];
+    let buf = &app.ppg_bufs[ch];
+
+    // Compute auto Y range from actual data.
+    let (min_v, max_v) = if buf.is_empty() {
+        (0.0_f64, 1.0_f64)
+    } else {
+        let min = buf.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = buf.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // Add 5% margin so the waveform doesn't touch the edges.
+        let margin = (max - min).max(1.0) * 0.05;
+        (min - margin, max + margin)
+    };
+
+    let data: Vec<(f64, f64)> = buf
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64 / PPG_HZ, v))
+        .collect();
+
+    let smoothed: Vec<(f64, f64)> = if app.smooth {
+        smooth_signal(&data, SMOOTH_WINDOW)
+    } else {
+        vec![]
+    };
+
+    let dim_color = match ch {
+        0 => Color::Rgb(0, 60, 90),   // dim light-blue
+        1 => Color::Rgb(90, 40, 40),  // dim light-red
+        _ => Color::Rgb(90, 0, 0),    // dim red
+    };
+
+    let datasets: Vec<Dataset> = if app.smooth {
+        vec![
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(dim_color))
+                .data(&data),
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(color))
+                .data(&smoothed),
+        ]
+    } else {
+        vec![Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(color))
+            .data(&data)]
+    };
+
+    let smooth_tag = if app.smooth { " [SMOOTH]" } else { "" };
+    let title = format!(
+        " {name}  min:{min_v:.0}  max:{max_v:.0}{smooth_tag} "
+    );
+
+    let y_mid = (min_v + max_v) / 2.0;
+    let y_labels: Vec<String> = vec![
+        format!("{:.0}", min_v),
+        format!("{:.0}", y_mid),
+        format!("{:.0}", max_v),
+    ];
+    let x_labels = vec![
+        "0s".to_string(),
+        format!("{:.1}s", WINDOW_SECS / 2.0),
+        format!("{:.0}s", WINDOW_SECS),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color)),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, WINDOW_SECS])
+                .labels(x_labels)
+                .style(Style::default().fg(Color::DarkGray)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([min_v, max_v])
+                .labels(y_labels)
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    frame.render_widget(chart, area);
 }
 
 /// Render a single EEG channel chart into `area`.
@@ -867,14 +1045,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         key("[Tab]"),
         Span::raw("Devices  "),
+        key("[1]"),
+        Span::raw("EEG  "),
+        key("[2]"),
+        Span::raw("PPG  "),
         key("[d]"),
         Span::raw("Disconnect  "),
-        key("[+]"),
-        Span::raw("Scale↑  "),
-        key("[-]"),
-        Span::raw("Scale↓  "),
+        key("[+/-]"),
+        Span::raw("Scale  "),
         key("[a]"),
-        Span::raw("Auto-scale  "),
+        Span::raw("Auto  "),
         key("[v]"),
         Span::raw(if app.smooth { "Raw  " } else { "Smooth  " }),
         key("[p]"),
@@ -1344,6 +1524,14 @@ async fn main() -> Result<()> {
             }
             KeyCode::Char('a') => {
                 app.lock().unwrap().auto_scale();
+            }
+
+            // View toggle: EEG / PPG
+            KeyCode::Char('1') => {
+                app.lock().unwrap().view = ViewMode::Eeg;
+            }
+            KeyCode::Char('2') => {
+                app.lock().unwrap().view = ViewMode::Ppg;
             }
 
             // Toggle smooth overlay
