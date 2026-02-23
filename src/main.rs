@@ -15,10 +15,13 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // ── Configuration ─────────────────────────────────────────────────────────
-    // Flip these flags to enable additional sensor data.
+    // Classic firmware: set enable_ppg / enable_aux to subscribe to those
+    // characteristics.  Athena firmware always streams all sensors (EEG, PPG,
+    // IMU, battery) on a single multiplexed characteristic regardless of
+    // these flags.
     let config = MuseClientConfig {
         enable_aux: false,
-        enable_ppg: false,
+        enable_ppg: true,
         scan_timeout_secs: 15,
         name_prefix: "Muse".into(),
     };

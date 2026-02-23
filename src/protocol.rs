@@ -129,6 +129,21 @@ pub const ATHENA_EEG_CHANNELS: usize = 8;
 /// 12-bit big-endian packing (18 bytes of payload per characteristic).
 pub const ATHENA_EEG_SAMPLES_PER_PKT: usize = 2;
 
+/// Number of optical channels in an Athena PPG notification.
+///
+/// Channel order: ambient (0), infrared (1), red (2).  A fourth channel is
+/// present in the raw 30-byte payload but currently unused.
+pub const ATHENA_PPG_CHANNELS: usize = 3;
+
+/// Samples per channel per Athena optical (PPG) notification.
+///
+/// Each tag-0x_4/0x_5 entry carries `ATHENA_PPG_CHANNELS × ATHENA_PPG_SAMPLES_PER_PKT`
+/// = 12 values packed as 20-bit LE unsigned integers into 30 bytes.
+pub const ATHENA_PPG_SAMPLES_PER_PKT: usize = 3;
+
+/// Athena PPG sample rate in Hz (same as Classic PPG).
+pub const ATHENA_PPG_FREQUENCY: f64 = 64.0;
+
 /// EEG voltage scale factor for Athena firmware in µV per raw LSB.
 ///
 /// `µV = (raw₁₄ − 8192) × ATHENA_EEG_SCALE`

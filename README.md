@@ -6,7 +6,13 @@ A Rust library and terminal UI for streaming real-time sensor data from
 Supports every Muse model — including the newer Muse S running the **Athena**
 firmware — and automatically selects the correct protocol at connection time.
 
-![demo](/docs/tui.png)
+## EEG view
+
+![demo](./docs/tui.png)
+
+## PPG view
+
+![PPG](./docs/ppg.png)
 
 ## Installation
 
@@ -23,9 +29,10 @@ cargo add muse-rs
 | Muse 1 (2014) | Classic | 4 | ✗ | ✗ | default |
 | Muse 2 | Classic | 4 | ✓ | ✓ | default |
 | Muse S | Classic | 4 | ✓ | ✓ | default |
-| Muse S | **Athena** | 8 | ✓\* | ✗ | auto-detected |
+| Muse S | **Athena** | 8 | ✓ | ✗ | auto-detected |
 
-\* Athena PPG data is received but not yet decoded into `MuseEvent::Ppg`.
+Athena PPG (optical) data is decoded from 20-bit LE packed samples into
+`MuseEvent::Ppg` — 3 samples per channel (ambient, infrared, red) at 64 Hz.
 
 ---
 
@@ -66,13 +73,19 @@ One dedicated GATT characteristic per sensor:
 All sensor data is **multiplexed onto one characteristic** using a tag-based
 binary framing:
 
-| Sensor | Tag(s) | Payload | Rate | Format |
+| Sensor | Tag (lower nibble) | Payload | Rate | Format |
 |---|---|---|---|---|
-| EEG (8 ch) | `0x11`, `0x12` | 28 B | 256 Hz | 14-bit LE packed, 2 samples/ch/pkt |
-| IMU (accel + gyro) | `0x47` | 36 B | ~52 Hz | 3 × (i16 LE accel + i16 LE gyro) |
-| Optical / PPG | `0x34`, `0x35` | 30 B | 64 Hz | not yet decoded |
-| Battery | `0x88`, `0x98` | 20 B | ~1 Hz | u16 LE fuel-gauge |
+| EEG (4/8 ch) | `0x_1` / `0x_2` | 28 B | 256 Hz | 14-bit LE packed, 2 samples/ch/pkt |
+| DRL / REF | `0x_3` | 7 B | 32 Hz | 14-bit LE (not emitted as event) |
+| Optical / PPG | `0x_4` / `0x_5` | 30 B | 64 Hz | 20-bit LE, 3×4ch samples |
+| IMU (accel + gyro) | `0x_7` | 36 B | ~52 Hz | 3 × (i16 LE accel + i16 LE gyro) |
+| Battery | `0x_8` | 20 B | ~1 Hz | u16 LE fuel-gauge |
 | Control | `273e0001` | — | cmd/resp | same as Classic |
+
+Tag bytes use the format `0xFT` where `F` = frequency-rate index (upper nibble)
+and `T` = data type (lower nibble).  The parser matches on the lower nibble
+only, so e.g. both `0x12` (256 Hz 8ch EEG) and `0x22` (128 Hz 8ch EEG) are
+recognised.
 
 **EEG scale:** `µV = (raw₁₄ − 8192) × 0.0885`
 
@@ -86,7 +99,9 @@ gyroscope scale is negated (−0.0074768 °/s/LSB vs. +0.0074768 for Classic).
 **Startup sequence:** `v4` → `s` → `h` → `p1045` → `dc001` × 2 → `L1` → 2 s wait
 (the 2-second wait is required by the firmware before data flows).
 
-**Resume command:** `dc001` (not `d`)
+**Resume command:** `dc001` (not `d`).  Some transitional fw 3.x Athena
+devices reject `dc001` (rc:69); the library sends both `dc001` and `d` as
+fallback.
 
 ### Side-by-side comparison
 
@@ -100,9 +115,9 @@ gyroscope scale is negated (−0.0074768 °/s/LSB vs. +0.0074768 for Classic).
 | EEG µV/LSB | 0.48828125 | 0.0885 |
 | IMU byte order | big-endian | little-endian |
 | Gyro sign | positive | negated |
-| Resume cmd | `d` | `dc001` |
+| Resume cmd | `d` | `dc001` (+ `d` fallback) |
 | Startup | 4 steps | 7 steps + 2 s wait |
-| PPG decoded | ✓ | ✗ (received, not decoded) |
+| PPG decoded | ✓ | ✓ (20-bit LE, 3×4ch) |
 
 ---
 
@@ -156,11 +171,11 @@ async fn main() -> anyhow::Result<()> {
 | `Accelerometer` | ✓ | ✓ | ✓ | ✓ |
 | `Gyroscope` | ✓ | ✓ | ✓ | ✓ |
 | `Telemetry` (battery) | ✓ | ✓ | ✓ | ✓ |
-| `Ppg` | ✗ | ✓\* | ✓\* | ✗† |
+| `Ppg` | ✗ | ✓\* | ✓\* | ✓ |
 | `Control` | ✓ | ✓ | ✓ | ✓ |
 
-\* Requires `enable_ppg: true` in `MuseClientConfig`.  
-† Athena optical data is received but the decoder is not yet implemented.
+\* Classic requires `enable_ppg: true` in `MuseClientConfig`.  
+Athena always includes PPG with preset `p1045`.
 
 ---
 
@@ -232,7 +247,7 @@ cargo run --bin tui -- --simulate  # built-in EEG simulator (no hardware needed)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  MUSE EEG Monitor  │  ● Muse-AB12  │  Bat 85%  │  21.3 pkt/s  │  ±500 µV     │
+│  MUSE EEG Monitor  │  ● Muse-AB12  │  EEG  │  Bat 85%  │  21.3 pkt/s  │  ±500 µV  │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ TP9  min: -38.2  max: +41.5  rms: 17.8 µV                    [SMOOTH]        │
 │ ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿  braille waveform, rolling 2-second window                │
@@ -243,7 +258,7 @@ cargo run --bin tui -- --simulate  # built-in EEG simulator (no hardware needed)
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ TP10 ...                                                                     │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ [Tab]Devices  [d]Disconnect  [+]Scale↑  [-]Scale↓  [a]Auto-scale  [v]Smooth  │
+│ [Tab]Devices [1]EEG [2]PPG [d]Disconnect [+/-]Scale [a]Auto [v]Smooth         │
 │ Accel x:+0.010g  y:+0.020g  z:-1.000g   Gyro x:+0.120°/s  …                  │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -282,11 +297,13 @@ advertising).
 | Key | Context | Action |
 |---|---|---|
 | `Tab` | streaming | open device picker |
+| `1` | streaming | switch to EEG view |
+| `2` | streaming | switch to PPG view |
 | `s` | streaming / picker | rescan for Muse devices |
 | `d` | streaming | disconnect and rescan |
-| `+` / `=` | streaming | zoom out (increase µV scale) |
-| `-` | streaming | zoom in (decrease µV scale) |
-| `a` | streaming | auto-scale to current peak |
+| `+` / `=` | streaming | zoom out (increase µV scale, EEG only) |
+| `-` | streaming | zoom in (decrease µV scale, EEG only) |
+| `a` | streaming | auto-scale to current peak (EEG only) |
 | `v` | streaming | toggle smooth overlay |
 | `p` | streaming | pause streaming |
 | `r` | streaming | resume streaming |
@@ -357,10 +374,10 @@ let config = MuseClientConfig {
 |---|---|---|---|
 | false | false | `p21` (EEG only) | `p1045` |
 | false | true | `p20` (EEG + AUX) | `p1045` |
-| true | — | `p50` (EEG + PPG) | `p1045` (PPG not decoded) |
+| true | — | `p50` (EEG + PPG) | `p1045` |
 
-> Athena always uses `p1045` regardless of PPG/AUX flags; individual sensor
-> enabling is not yet supported for that firmware.
+> Athena always uses `p1045` regardless of PPG/AUX flags; all sensors
+> (EEG, PPG, IMU, battery) are streamed on the multiplexed characteristic.
 
 ---
 
@@ -415,12 +432,20 @@ Each notification: 9-byte header + tag-based entries.  EEG payload (28 bytes):
 µV = (raw₁₄ − 8192) × 0.0885
 ```
 
-### PPG decoding (Classic only)
+### PPG decoding
 
-Six 24-bit big-endian integers per notification:
+**Classic:** six 24-bit big-endian integers per notification:
 
 ```
 value = (b0 << 16) | (b1 << 8) | b2
+```
+
+**Athena:** 30-byte payload, 12 × 20-bit LE unsigned integers (3 samples × 4
+channels, sample-major layout).  Channels 0–2 = ambient, infrared, red:
+
+```
+raw = parseUintLE(payload, 20)    // 12 values
+ch_samples[ch][s] = raw[s * 4 + ch]
 ```
 
 ### Timestamp reconstruction (Classic only)

@@ -10,9 +10,11 @@
 //! | Muse 1 (2014) | Classic | 4 | ✗ | baseline feature set |
 //! | Muse 2 | Classic | 4 + AUX | ✓ | PPG requires `enable_ppg: true` |
 //! | Muse S | Classic | 4 + AUX | ✓ | same protocol as Muse 2 |
-//! | Muse S | **Athena** | **8** | ✗† | auto-detected; different wire format |
+//! | Muse S | **Athena** | **8** | **✓** | auto-detected; PPG always included with preset `p1045` |
 //!
-//! † Athena optical/PPG data is decoded from 20-bit packed samples (tags 0x_4/0x_5).
+//! Athena PPG data is decoded from 20-bit LE packed samples (tag lower nibble
+//! 0x4/0x5) into [`types::PpgReading`] events — 3 samples per channel
+//! (ambient, infrared, red) at 64 Hz.
 //!
 //! Firmware is detected automatically at connect time — no configuration is
 //! required.  See the [README](https://github.com/eugenehp/muse-rs#firmware-variants-classic-vs-athena)
@@ -105,6 +107,7 @@ pub mod prelude {
 
     // ── Protocol constants ────────────────────────────────────────────────────
     pub use crate::protocol::{
+        ATHENA_PPG_CHANNELS, ATHENA_PPG_FREQUENCY, ATHENA_PPG_SAMPLES_PER_PKT,
         EEG_CHANNEL_NAMES, EEG_FREQUENCY, EEG_SAMPLES_PER_READING, PPG_CHANNEL_NAMES,
         PPG_FREQUENCY, PPG_SAMPLES_PER_READING,
     };
