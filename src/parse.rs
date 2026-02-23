@@ -332,37 +332,60 @@ fn parse_uint_le_bits(data: &[u8], bit_width: usize) -> Vec<u32> {
 /// # Packet layout
 ///
 /// ```text
-/// [0..8]  9-byte header  (byte[1] = global event index, rest unused here)
-/// [9..]   tag-based entries, repeated:
-///           byte 0     : tag
-///           bytes 1-4  : 4-byte metadata (skipped)
-///           bytes 5+   : payload (length determined by tag)
+/// byte[0]     packet length
+/// [1..8]      header (byte[1] = pkt_index, bytes[2..6] = device clock, etc.)
+/// byte[9]     first subpacket tag (= pkt_id in OpenMuse terminology)
+/// [10..13]    4-byte subpacket metadata
+/// [14..]      first subpacket payload, then additional [TAG][META4][PAYLOAD]…
 /// ```
 ///
-/// # Known tags
+/// The first subpacket's type is given by `byte[9]`; subsequent subpackets
+/// each carry their own 1-byte tag + 4-byte metadata header before the
+/// payload.  This layout is documented in OpenMuse (`decode.py`).
 ///
-/// | Tag         | Sensor  | Payload | Channels | Samples/ch | Rate   |
-/// |-------------|---------|---------|----------|------------|--------|
-/// | 0x11 / 0x12 | EEG     | 28 B    | 8        | 2          | 256 Hz |
-/// | 0x47        | IMU     | 36 B    | –        | 3          | 52 Hz  |
-/// | 0x34 / 0x35 | PPG     | 30 B    | 4        | 3          | 64 Hz  |
-/// | 0x88 / 0x98 | Battery | 20 B    | –        | 1          | 1 Hz   |
+/// # Known tags (based on OpenMuse SENSORS table)
+///
+/// | Tag  | Sensor      | Payload   | Channels | Samples/ch | Rate   |
+/// |------|-------------|-----------|----------|------------|--------|
+/// | 0x11 | EEG 4ch     | 28 B      | 4        | 4          | 256 Hz |
+/// | 0x12 | EEG 8ch     | 28 B      | 8        | 2          | 256 Hz |
+/// | 0x34 | Optical 4ch | 30 B      | 4        | 3          | 64 Hz  |
+/// | 0x35 | Optical 8ch | 40 B      | 8        | 2          | 64 Hz  |
+/// | 0x36 | Optical 16ch| 40 B      | 16       | 1          | 64 Hz  |
+/// | 0x47 | IMU         | 36 B      | 6        | 3          | 52 Hz  |
+/// | 0x53 | DRL/REF     | 24 B      | –        | –          | 32 Hz  |
+/// | 0x88 | Battery (new)| 188–230 B| 1        | 1          | ~0.2 Hz|
+/// | 0x98 | Battery (old)| 20 B     | 1        | 1          | 1 Hz   |
 ///
 /// Unknown tags advance the cursor by one byte to re-synchronise.
-/// Athena tag data-type codes (lower 4 bits of the tag byte).
+/// Look up the payload size for a known Athena tag byte.
 ///
-/// The upper 4 bits encode the sampling-rate index (see `ATHENA_FREQ_MAP`
-/// in the TypeScript `athena-parser.ts`); only the lower nibble determines
-/// the payload format.
-mod athena_tag {
-    pub const EEG_4CH: u8 = 0x1;
-    pub const EEG_8CH: u8 = 0x2;
-    pub const DRL_REF: u8 = 0x3;
-    pub const OPTICAL_4CH: u8 = 0x4;
-    pub const OPTICAL_8CH: u8 = 0x5;
-    // 0x6 = OPTICAL_16CH (unused)
-    pub const IMU: u8 = 0x7;
-    pub const BATTERY: u8 = 0x8;
+/// Based on the SENSORS table from the OpenMuse project
+/// (`DominiqueMakowski/OpenMuse`, `decode.py`).  Payload sizes depend on
+/// the **full tag byte**, not just the lower nibble, because some sensor
+/// categories (optical, battery) have different sizes per variant.
+///
+/// Returns `None` for unknown tags.
+pub fn athena_payload_len(tag: u8) -> Option<usize> {
+    match tag {
+        // EEG — 4ch×4samples or 8ch×2samples, both 28 B (14-bit packed)
+        0x11 | 0x12 => Some(28),
+        // Optical 4ch — 3 samples × 4ch, 20-bit packed
+        0x34 => Some(30),
+        // Optical 8ch — 2 samples × 8ch, 20-bit packed
+        0x35 => Some(40),
+        // Optical 16ch — 1 sample × 16ch, 20-bit packed
+        0x36 => Some(40),
+        // IMU (accel + gyro) — 3 samples × 6ch, 16-bit LE signed
+        0x47 => Some(36),
+        // DRL/REF — 24 B per OpenMuse (0x53 = freq 0x5 + type 0x3)
+        0x53 => Some(24),
+        // Battery (new firmware) — variable 188–230 B; only first 2 used
+        0x88 => None, // handled specially: consume rest of packet
+        // Battery (old firmware) — 20 B
+        0x98 => Some(20),
+        _ => None,
+    }
 }
 
 pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
@@ -373,32 +396,31 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
         return vec![];
     }
 
+    // byte[0] = total packet length (used for 0x88 battery boundary).
+    let pkt_len = data[0] as usize;
+
     let mut events = Vec::new();
     let mut idx = HEADER;
 
     while idx < data.len() {
         let tag = data[idx];
-        let tag_type = tag & 0x0F; // lower nibble = data type
         let payload_start = idx + 1 + META;
 
-        match tag_type {
-            // ── EEG (4-ch or 8-ch) ───────────────────────────────────────────
-            // 14-bit LE unsigned, channel-major layout.
-            // Scale: (raw − 8192) × 0.0885 µV
-            athena_tag::EEG_4CH | athena_tag::EEG_8CH => {
-                const PLEN: usize = 28;
-                let end = payload_start + PLEN;
-                if end > data.len() {
-                    idx += 1;
-                    continue;
-                }
+        match tag {
+            // ── EEG 4-channel ─────────────────────────────────────────────────
+            // 4 channels × 4 samples, 14-bit LE unsigned, sample-major layout.
+            // 28 bytes → 16 values.  Layout: [s0_ch0, s0_ch1, s0_ch2, s0_ch3,
+            //                                  s1_ch0, … s3_ch3]
+            0x11 => {
+                let end = payload_start + 28;
+                if end > data.len() { idx += 1; continue; }
                 let raw = parse_uint_le_bits(&data[payload_start..end], 14);
-                const SAMPLES_PER_CH: usize = 2;
-                let num_ch = raw.len() / SAMPLES_PER_CH;
-                for ch in 0..num_ch {
-                    let samples: Vec<f64> = raw
-                        [ch * SAMPLES_PER_CH..(ch + 1) * SAMPLES_PER_CH]
-                        .iter()
+                // 16 values = 4 samples × 4 channels (sample-major per OpenMuse)
+                let n_ch = 4usize;
+                let n_samp = 4usize;
+                for ch in 0..n_ch {
+                    let samples: Vec<f64> = (0..n_samp)
+                        .filter_map(|s| raw.get(s * n_ch + ch))
                         .map(|&v| (v as f64 - 8192.0) * ATHENA_EEG_SCALE)
                         .collect();
                     events.push(MuseEvent::Eeg(EegReading {
@@ -411,24 +433,88 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
                 idx = end;
             }
 
-            // ── DRL / REF ─────────────────────────────────────────────────────
-            // 7-byte payload, 14-bit LE unsigned.  Parsed but not emitted as a
-            // MuseEvent yet — just advance the cursor to stay in sync.
-            athena_tag::DRL_REF => {
-                const PLEN: usize = 7;
-                let end = payload_start + PLEN;
-                idx = if end > data.len() { idx + 1 } else { end };
+            // ── EEG 8-channel ─────────────────────────────────────────────────
+            // 8 channels × 2 samples, 14-bit LE unsigned, sample-major layout.
+            0x12 => {
+                let end = payload_start + 28;
+                if end > data.len() { idx += 1; continue; }
+                let raw = parse_uint_le_bits(&data[payload_start..end], 14);
+                let n_ch = 8usize;
+                let n_samp = 2usize;
+                for ch in 0..n_ch {
+                    let samples: Vec<f64> = (0..n_samp)
+                        .filter_map(|s| raw.get(s * n_ch + ch))
+                        .map(|&v| (v as f64 - 8192.0) * ATHENA_EEG_SCALE)
+                        .collect();
+                    events.push(MuseEvent::Eeg(EegReading {
+                        index: 0,
+                        electrode: ch,
+                        timestamp: 0.0,
+                        samples,
+                    }));
+                }
+                idx = end;
+            }
+
+            // ── Optical 4ch (PPG) ─────────────────────────────────────────────
+            // 3 samples × 4 channels, 20-bit LE unsigned, 64 Hz.
+            // 30 bytes → 12 values, sample-major: [s0_ch0..s0_ch3, s1_ch0..]
+            0x34 => {
+                let end = payload_start + 30;
+                if end > data.len() { idx += 1; continue; }
+                let raw = parse_uint_le_bits(&data[payload_start..end], 20);
+                let n_ch = 4usize;
+                let n_samp = 3usize;
+                for ch in 0..n_ch.min(3) {
+                    let samples: Vec<u32> = (0..n_samp)
+                        .filter_map(|s| raw.get(s * n_ch + ch).copied())
+                        .collect();
+                    events.push(MuseEvent::Ppg(PpgReading {
+                        index: 0,
+                        ppg_channel: ch,
+                        timestamp: 0.0,
+                        samples,
+                    }));
+                }
+                idx = end;
+            }
+
+            // ── Optical 8ch ───────────────────────────────────────────────────
+            // 2 samples × 8 channels, 20-bit LE unsigned.  40 bytes → 16 values.
+            0x35 => {
+                let end = payload_start + 40;
+                if end > data.len() { idx += 1; continue; }
+                let raw = parse_uint_le_bits(&data[payload_start..end], 20);
+                let n_ch = 8usize;
+                let n_samp = 2usize;
+                for ch in 0..n_ch.min(3) {
+                    let samples: Vec<u32> = (0..n_samp)
+                        .filter_map(|s| raw.get(s * n_ch + ch).copied())
+                        .collect();
+                    events.push(MuseEvent::Ppg(PpgReading {
+                        index: 0,
+                        ppg_channel: ch,
+                        timestamp: 0.0,
+                        samples,
+                    }));
+                }
+                idx = end;
+            }
+
+            // ── Optical 16ch ──────────────────────────────────────────────────
+            // 1 sample × 16 channels, 20-bit LE unsigned.  40 bytes → 16 values.
+            0x36 => {
+                let end = payload_start + 40;
+                if end > data.len() { idx += 1; continue; }
+                // Skip: 16-channel optical layout not yet mapped to PpgReading.
+                idx = end;
             }
 
             // ── IMU ───────────────────────────────────────────────────────────
-            // 3 samples × (ACC[3] + GYRO[3]), 16-bit LE signed.
-            athena_tag::IMU => {
-                const PLEN: usize = 36;
-                let end = payload_start + PLEN;
-                if end > data.len() {
-                    idx += 1;
-                    continue;
-                }
+            // 3 samples × (ACC[3] + GYRO[3]), 16-bit LE signed, 36 bytes.
+            0x47 => {
+                let end = payload_start + 36;
+                if end > data.len() { idx += 1; continue; }
                 let vals: Vec<i16> = data[payload_start..end]
                     .chunks_exact(2)
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
@@ -458,65 +544,54 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
                 idx = end;
             }
 
-            // ── Optical / PPG ──────────────────────────────────────────────────
-            // 3 samples × 4 channels, 20-bit LE unsigned, 64 Hz.
-            // Channels: 0 = ambient, 1 = infrared, 2 = red, 3 = (unused/extra)
-            // Scale: raw / 32768 (matching TypeScript athena-parser.ts)
-            //
-            // We emit one PpgReading per channel (0..2) with 3 samples each,
-            // mirroring the Classic PPG layout.
-            athena_tag::OPTICAL_4CH | athena_tag::OPTICAL_8CH => {
-                const PLEN: usize = 30;
-                let end = payload_start + PLEN;
-                if end > data.len() {
-                    idx += 1;
-                    continue;
-                }
-                let raw = parse_uint_le_bits(&data[payload_start..end], 20);
-                // raw layout: 12 values = 3 samples × 4 channels (sample-major)
-                // raw[s*4 + ch] = sample s, channel ch
-                const NUM_SAMPLES: usize = 3;
-                const NUM_CH: usize = 4;
-                // Emit channels 0..2 (ambient, infrared, red); skip ch 3.
-                for ch in 0..NUM_CH.min(3) {
-                    let samples: Vec<u32> = (0..NUM_SAMPLES)
-                        .filter_map(|s| raw.get(s * NUM_CH + ch).copied())
-                        .collect();
-                    events.push(MuseEvent::Ppg(PpgReading {
-                        index: 0,
-                        ppg_channel: ch,
-                        timestamp: 0.0,
-                        samples,
-                    }));
-                }
+            // ── DRL / REF ─────────────────────────────────────────────────────
+            // 24-byte payload (per OpenMuse).  Not emitted as a MuseEvent.
+            0x53 => {
+                let end = payload_start + 24;
+                idx = if end > data.len() { idx + 1 } else { end };
+            }
+
+            // ── Battery (new firmware, tag 0x88) ──────────────────────────────
+            // Variable-length payload (188–230 bytes).  Battery SOC in first
+            // 2 bytes: u16 LE / 256.0 = percentage.
+            // Since the payload length varies, consume everything up to the
+            // packet boundary indicated by byte[0] (pkt_len).
+            0x88 => {
+                if payload_start + 2 > data.len() { idx += 1; continue; }
+                let raw = u16::from_le_bytes([data[payload_start], data[payload_start + 1]]);
+                let battery_level = (raw as f32 / 256.0).clamp(0.0, 100.0);
+                events.push(MuseEvent::Telemetry(TelemetryData {
+                    sequence_id: 0,
+                    battery_level,
+                    fuel_gauge_voltage: 0.0,
+                    temperature: 0,
+                }));
+                // Consume rest of packet — 0x88 payload is variable-length and
+                // there are no further subpackets after it.
+                idx = pkt_len.min(data.len());
+            }
+
+            // ── Battery (old firmware, tag 0x98) ──────────────────────────────
+            // Fixed 20-byte payload = 10 × u16 LE.  Battery SOC in first 2
+            // bytes: u16 LE / 256.0 = percentage (confirmed by OpenMuse and
+            // matching control JSON `bp` field).
+            0x98 => {
+                let end = payload_start + 20;
+                if end > data.len() { idx += 1; continue; }
+                let raw = u16::from_le_bytes([data[payload_start], data[payload_start + 1]]);
+                let battery_level = (raw as f32 / 256.0).clamp(0.0, 100.0);
+                events.push(MuseEvent::Telemetry(TelemetryData {
+                    sequence_id: 0,
+                    battery_level,
+                    fuel_gauge_voltage: 0.0,
+                    temperature: 0,
+                }));
                 idx = end;
             }
 
-            // ── Battery ───────────────────────────────────────────────────────
-            athena_tag::BATTERY => {
-                const PLEN: usize = 20;
-                let end = payload_start + PLEN;
-                if end > data.len() {
-                    idx += 1;
-                    continue;
-                }
-                let block = &data[payload_start..end];
-                if block.len() >= 2 {
-                    let raw = u16::from_le_bytes([block[0], block[1]]);
-                    let battery_level = (raw as f32 / 512.0).clamp(0.0, 100.0);
-                    events.push(MuseEvent::Telemetry(TelemetryData {
-                        sequence_id: 0,
-                        battery_level,
-                        fuel_gauge_voltage: 0.0,
-                        temperature: 0,
-                    }));
-                }
-                idx = end;
-            }
-
-            // ── Unknown tag: advance one byte to stay in sync ─────────────────
+            // ── Unknown tag ───────────────────────────────────────────────────
             _ => {
-                log::debug!("Athena: unknown tag 0x{tag:02x} (type=0x{tag_type:x}) at offset {idx}");
+                log::debug!("Athena: unknown tag 0x{tag:02x} at offset {idx}");
                 idx += 1;
             }
         }

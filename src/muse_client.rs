@@ -507,26 +507,24 @@ impl MuseClient {
                         );
                         if sensor_count <= 3 && !data.is_empty() {
                             // Dump ALL tags found in the packet for debugging.
+                            let pkt_len = data[0] as usize;
                             let mut tags = Vec::new();
                             let mut ti = 9usize; // skip 9-byte header
                             while ti < data.len() {
-                                tags.push(format!("0x{:02x}@{}", data[ti], ti));
-                                let tag_type = data[ti] & 0x0F;
+                                let t = data[ti];
+                                tags.push(format!("0x{t:02x}@{ti}"));
                                 let payload_start = ti + 1 + 4;
-                                let plen = match tag_type {
-                                    0x1 | 0x2 => 28, // EEG
-                                    0x3 => 7,        // DRL/REF
-                                    0x4 | 0x5 => 30, // Optical
-                                    0x7 => 36,       // IMU
-                                    0x8 => 20,       // Battery
-                                    _ => 0,          // unknown → advance 1
-                                };
-                                if plen > 0 && payload_start + plen <= data.len() {
-                                    ti = payload_start + plen;
-                                } else if plen > 0 {
-                                    break; // truncated
+                                if let Some(plen) = crate::parse::athena_payload_len(t) {
+                                    if payload_start + plen <= data.len() {
+                                        ti = payload_start + plen;
+                                    } else {
+                                        break; // truncated
+                                    }
+                                } else if t == 0x88 {
+                                    // Variable-length battery: skip to end.
+                                    ti = pkt_len.min(data.len());
                                 } else {
-                                    ti += 1;
+                                    ti += 1; // unknown
                                 }
                             }
                             debug!("Athena sensor tags: [{}]", tags.join(", "));
