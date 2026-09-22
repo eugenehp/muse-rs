@@ -162,10 +162,10 @@ Use `muse-rs` as a library in your own project:
 # Cargo.toml
 
 # Full build (includes TUI feature):
-muse-rs = "0.1.0"
+muse-rs = "0.2.0"
 
 # Library only — skips ratatui / crossterm compilation:
-muse-rs = { version = "0.1.0", default-features = false }
+muse-rs = { version = "0.2.0", default-features = false }
 ```
 
 ```rust
@@ -258,11 +258,11 @@ allow-list, then re-run.
 
 ### macOS — BLE disconnect detection
 
-This project uses a [fork of btleplug](https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version)
-with improved macOS support, including reliable disconnect detection via
-`CentralEvent::DeviceDisconnected`, expanded broadcast channel buffers, and
-null-safety improvements that prevent hangs when a peripheral becomes
-unreachable.
+BLE goes through [webbluetooth](https://github.com/eugenehp/webbluetooth), a
+Rust port of the Web Bluetooth API that talks to CoreBluetooth directly.
+Disconnects arrive on `BluetoothDevice::watch_disconnect()`, which fires per
+device rather than per adapter, and every notification subscription ends with
+the link, so a headset that goes out of range is noticed either way.
 
 ---
 
@@ -392,13 +392,48 @@ Fake accelerometer, gyroscope, and battery data are updated at ~1 Hz.
 
 ## Console streamer (`muse-rs` binary)
 
+Three commands, in the order you need them: what is in range, what does it
+stream, and give me the data.
+
 ```bash
-cargo run --release
+cargo run -- scan      # list the Muse devices nearby
+cargo run -- info      # connect and report what this one streams
+cargo run              # stream (the default)
+cargo run -- --help    # every option
 ```
 
-Scans up to 15 seconds, connects to the first Muse found, and streams all
-decoded events to stdout.  Works with both Classic and Athena firmware.
-PPG streaming is enabled by default.
+`info` is the one to reach for first with an unfamiliar headset — it reports
+the firmware, the battery, the preset in use, and the channels that actually
+arrived, by name and rate:
+
+```
+MuseS-F921
+  firmware    Athena
+  version     fw 3.1.11 · hw 01.0 · Athena_RevE
+  battery     61.9 %
+  preset      p1041
+
+  observed over 4.0s
+    EEG         8 ch @ 256 Hz   TP9 AF7 AF8 TP10 FPz AUX_R AUX_L AUX
+    optical    16 ch @  64 Hz   ambient infrared red opt3 opt4 … opt15
+    IMU         accel 52 Hz · gyro 52 Hz
+    telemetry   1.2 Hz
+```
+
+`stream` summarises once a second rather than printing every event — Athena
+sends around 1,400 events a second across 24 channels, which as a line each is
+not output so much as a denial of service. `--raw` restores the per-event dump
+for piping into a parser.
+
+| Option | |
+|---|---|
+| `--device <NAME\|ID>` | connect to a particular one (see `scan`) |
+| `--prefix <PREFIX>` | narrow the scan by advertised name (default `Muse`) |
+| `--timeout <SECS>` | how long to scan (default 15) |
+| `--no-ppg` | optical off — on Athena, the narrowest optical mode |
+| `--aux` | Classic only: add the AUX electrode |
+| `--preset <PRESET>` | send a preset after startup, e.g. `p1044` |
+| `--raw` | every event, instead of the summary |
 
 ### Interactive commands (type + Enter)
 
@@ -559,7 +594,7 @@ stream, handling nested objects and fragments that split mid-token.
 
 | Crate | Purpose |
 |---|---|
-| [btleplug](https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version) | Cross-platform BLE (forked for improved macOS support) |
+| [webbluetooth](https://github.com/eugenehp/webbluetooth) | The Web Bluetooth API in Rust — cross-platform BLE |
 | [tokio](https://tokio.rs) | Async runtime |
 | [ratatui](https://ratatui.rs) | Terminal UI framework (optional, `tui` feature) |
 | [crossterm](https://github.com/crossterm-rs/crossterm) | Terminal backend (optional, `tui` feature) |
@@ -570,7 +605,7 @@ stream, handling nested objects and fragments that split mid-token.
 
 * [OpenMuse](https://github.com/DominiqueMakowski/OpenMuse) — Python Muse S / Athena decoder; used as reference for tag-based packet structure, payload sizes, battery decoding, and EEG/optical channel layouts
 * [muse-jsx](https://github.com/eugenehp/muse-jsx) — TypeScript reference implementation (Web Bluetooth); basis for the Athena startup sequence and `parsePacket()` tag decoder
-* [btleplug](https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version) — Cross-platform BLE library for Rust (fork with improved macOS disconnect handling)
+* [webbluetooth](https://github.com/eugenehp/webbluetooth) — The Web Bluetooth API for Rust; the BLE layer this client is built on
 * [urish/muse-js](https://github.com/urish/muse-js) — Original muse-js library by Uri Shaked
 * [Interaxon Muse](https://choosemuse.com/) — Official Muse headset manufacturer
 
@@ -588,7 +623,7 @@ If you use `muse-rs` in academic research or published work, please cite it as:
   title        = {muse-rs: Rust Library and TUI for Muse EEG Headsets},
   year         = {2026},
   url          = {https://github.com/eugenehp/muse-rs},
-  version      = {0.1.0},
+  version      = {0.2.0},
   description  = {Async Rust library and terminal UI for streaming real-time
                   EEG, PPG, IMU, and battery data from Interaxon Muse headsets
                   over Bluetooth Low Energy. Supports Classic and Athena
@@ -598,7 +633,7 @@ If you use `muse-rs` in academic research or published work, please cite it as:
 
 ### APA
 
-> Hauptmann, E. (2026). *muse-rs: Rust Library and TUI for Muse EEG Headsets* (Version 0.1.0) [Computer software]. https://github.com/eugenehp/muse-rs
+> Hauptmann, E. (2026). *muse-rs: Rust Library and TUI for Muse EEG Headsets* (Version 0.2.0) [Computer software]. https://github.com/eugenehp/muse-rs
 
 ### IEEE
 

@@ -1,15 +1,17 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
-use btleplug::api::{
-    Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
-};
-use btleplug::platform::{Adapter, Manager, Peripheral};
-use futures::StreamExt;
+use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use webbluetooth::chooser::{Candidate, FirstMatch};
+use webbluetooth::stream::{select_all, BoxStream, StreamExt};
+use webbluetooth::uuid::BluetoothUuid;
+use webbluetooth::{
+    Bluetooth, BluetoothDevice, DeviceFilter, Grant, LeScanOptions, RemoteGattCharacteristic,
+    RemoteGattServer, RequestDeviceOptions,
+};
 
 use crate::parse::{
     decode_eeg_samples, parse_accelerometer, parse_athena_notification, parse_gyroscope,
@@ -18,10 +20,70 @@ use crate::parse::{
 use crate::protocol::{
     decode_response, encode_command, ACCELEROMETER_CHARACTERISTIC, ATHENA_SENSOR_CHARACTERISTIC,
     CONTROL_CHARACTERISTIC, EEG_CHARACTERISTICS, EEG_FREQUENCY, EEG_SAMPLES_PER_READING,
-    GYROSCOPE_CHARACTERISTIC, PPG_CHARACTERISTICS, PPG_FREQUENCY, PPG_SAMPLES_PER_READING,
-    TELEMETRY_CHARACTERISTIC,
+    GYROSCOPE_CHARACTERISTIC, MUSE_SERVICE_UUID, PPG_CHARACTERISTICS, PPG_FREQUENCY,
+    PPG_SAMPLES_PER_READING, TELEMETRY_CHARACTERISTIC,
 };
 use crate::types::{ControlResponse, EegReading, MuseEvent};
+
+// ── GATT helpers ──────────────────────────────────────────────────────────────
+
+// The adapter session is `Bluetooth::shared()`: one per process, cloned by
+// every caller. It has to be shared, because a `MuseDevice` is only usable
+// through the session that found it and the TUI scans with one `MuseClient`
+// and connects with another.
+//
+// The `Uuid` constants in `crate::protocol` are passed to webbluetooth as they
+// are, without conversion, through its `uuid` feature.
+
+/// What a device request asks for: Muse headsets by name, plus access to the
+/// vendor service every Muse characteristic lives under.
+///
+/// The service is named even though the filter matches on the name, because a
+/// Web Bluetooth grant covers exactly the services a request lists and
+/// `get_primary_service` refuses everything else.
+fn request_options(name_prefix: &str) -> Result<RequestDeviceOptions> {
+    Ok(RequestDeviceOptions::new()
+        .filter(DeviceFilter::new().name_prefix(name_prefix))
+        .optional_service(MUSE_SERVICE_UUID)?)
+}
+
+/// What a scan reports: advertisements from anything named like a Muse.
+///
+/// A scan grants nothing, so there is no service to name here — only what
+/// should be reported.
+fn scan_options(name_prefix: &str) -> LeScanOptions {
+    LeScanOptions::new().filter(DeviceFilter::new().name_prefix(name_prefix))
+}
+
+/// What adopting a scanned device grants: the one vendor service, and no
+/// manufacturer data.
+fn muse_grant() -> Result<Grant> {
+    Ok(Grant::new().service(MUSE_SERVICE_UUID)?)
+}
+
+/// Pick one characteristic out of a service's discovered set.
+fn find_char(chars: &[RemoteGattCharacteristic], uuid: Uuid) -> Result<RemoteGattCharacteristic> {
+    let want = BluetoothUuid::from(uuid);
+    chars
+        .iter()
+        .find(|c| *c.uuid() == want)
+        .cloned()
+        .ok_or_else(|| anyhow!("Characteristic {uuid} not found"))
+}
+
+/// Subscribe to a characteristic and tag each notification with its UUID.
+///
+/// Web Bluetooth subscribes per characteristic and yields bare values, so the
+/// UUID is attached here and [`stream::select_all`] merges the tagged streams
+/// back into the single stream the dispatch loops read.
+async fn subscribe_tagged(
+    chars: &[RemoteGattCharacteristic],
+    uuid: Uuid,
+) -> Result<BoxStream<'static, (Uuid, Vec<u8>)>> {
+    let characteristic = find_char(chars, uuid)?;
+    let notifications = characteristic.start_notifications().await?;
+    Ok(notifications.map(move |value| (uuid, value)).boxed())
+}
 
 // ── Timestamp helper ──────────────────────────────────────────────────────────
 
@@ -142,14 +204,12 @@ pub struct MuseDevice {
     /// Advertised device name (e.g. `"Muse-AB12"`).
     pub name: String,
     /// Platform BLE identifier.
-    /// • macOS / Windows — a UUID string
-    /// • Linux — a Bluetooth MAC address (`AA:BB:CC:DD:EE:FF`)
+    /// • macOS / iOS — a per-host UUID the system assigns; the same headset
+    ///   has a different one on a different machine, because Apple never
+    ///   exposes the hardware address
+    /// • elsewhere — the Bluetooth address (`AA:BB:CC:DD:EE:FF`)
     pub id: String,
-    pub(crate) peripheral: Peripheral,
-    /// The adapter that discovered this device.  Kept so that
-    /// [`MuseClient::connect_to`] can listen for disconnect events on the
-    /// correct adapter without creating a second `Manager`.
-    pub(crate) adapter: Adapter,
+    pub(crate) device: BluetoothDevice,
 }
 
 // ── MuseClientConfig ──────────────────────────────────────────────────────────
@@ -163,14 +223,20 @@ pub struct MuseClientConfig {
     /// Subscribe to the AUX (5th) EEG channel.
     ///
     /// **Classic firmware only** — changes the startup preset from `p21` to `p20`.
-    /// Has no effect on Athena firmware (`p1045` is always used).
+    /// No effect on Athena, whose eight channels already include the auxiliary
+    /// inputs — see [`crate::protocol::ATHENA_EEG_CHANNEL_NAMES`].
     /// Default: `false`.
     pub enable_aux: bool,
-    /// Subscribe to the three PPG (optical heart-rate) channels.
+    /// Subscribe to the optical (PPG) channels.
     ///
-    /// **Classic firmware only** — changes the startup preset to `p50`.
-    /// Has no effect on Athena firmware; Athena optical data is received but
-    /// not yet decoded into [`crate::types::MuseEvent::Ppg`].
+    /// **Classic** — changes the startup preset to `p50`, giving three
+    /// channels.
+    ///
+    /// **Athena** — selects preset `p1044` (eight optical channels) over
+    /// `p1041` (none). Athena optical data *is* decoded into
+    /// [`crate::types::MuseEvent::Ppg`]; every channel the mode carries is
+    /// reported, which is four, eight or sixteen depending on the preset.
+    ///
     /// Default: `false`.
     pub enable_ppg: bool,
     /// BLE scan duration in seconds before giving up. Default: `15`.
@@ -226,69 +292,50 @@ impl MuseClient {
     /// The scan runs for `config.scan_timeout_secs` seconds so that multiple
     /// devices in range can all be discovered before the function returns.
     ///
-    /// On macOS, `CBCentralManager` needs a moment to reach the *poweredOn*
-    /// state after initialisation; we wait up to 2 s for that before starting
-    /// the actual RF scan.
+    /// Every device returned has already been granted access to the Muse
+    /// service, so [`MuseClient::connect_to`] does not have to scan again.
     pub async fn scan_all(&self) -> Result<Vec<MuseDevice>> {
-        let manager = Manager::new().await?;
-        let adapters = manager.adapters().await?;
-        let adapter = adapters
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("No Bluetooth adapter found"))?;
+        let bluetooth = Bluetooth::shared();
 
-        // ── macOS: wait for the CoreBluetooth manager to reach poweredOn ─────
-        // When the binary is freshly launched (or Bluetooth was recently
-        // toggled), CBCentralManager starts in an "unknown" state.
-        // Calling scanForPeripherals before it is ready is a silent no-op.
-        // We poll adapter_state() and only proceed once it reports PoweredOn.
-        #[cfg(target_os = "macos")]
-        {
-            use btleplug::api::CentralState;
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                match adapter.adapter_state().await {
-                    Ok(CentralState::PoweredOn) => {
-                        info!("macOS: adapter is PoweredOn");
-                        break;
-                    }
-                    Ok(state) => {
-                        if tokio::time::Instant::now() >= deadline {
-                            warn!("macOS: adapter still in state {state:?} after 3 s — proceeding anyway");
-                            break;
-                        }
-                        debug!("macOS: adapter state = {state:?}, waiting…");
-                    }
-                    Err(e) => {
-                        warn!("macOS: adapter_state() error: {e}");
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            // Extra safety margin — let the delegate settle.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+        // Waits for the adapter's first state report — what the old macOS
+        // "wait for poweredOn" polling loop was doing by hand.
+        bluetooth
+            .availability()
+            .await
+            .context("Bluetooth is not usable")?;
 
         info!(
             "scan_all: scanning for {} s …",
             self.config.scan_timeout_secs
         );
-        adapter.start_scan(ScanFilter::default()).await?;
-        tokio::time::sleep(Duration::from_secs(self.config.scan_timeout_secs)).await;
-        adapter.stop_scan().await.ok();
+        let mut scan = bluetooth
+            .request_le_scan(scan_options(&self.config.name_prefix))
+            .await?;
 
-        let mut found = vec![];
-        for p in adapter.peripherals().await? {
-            if let Ok(Some(props)) = p.properties().await {
-                if let Some(name) = props.local_name {
-                    if name.starts_with(&self.config.name_prefix) {
-                        let id = p.id().to_string();
-                        info!("scan_all: found {name}  id={id}");
-                        found.push(MuseDevice { name, id, peripheral: p, adapter: adapter.clone() });
-                    }
+        // A scan reports advertisements, and a headset advertises repeatedly;
+        // keyed by id, each one is kept once.
+        let mut seen: BTreeMap<String, Candidate> = BTreeMap::new();
+        let window = Duration::from_secs(self.config.scan_timeout_secs);
+        let _ = tokio::time::timeout(window, async {
+            while let Some(candidate) = scan.next().await {
+                if !seen.contains_key(&candidate.id) {
+                    info!("scan_all: found {}  id={}", candidate.label(), candidate.id);
                 }
+                seen.insert(candidate.id.clone(), candidate);
+            }
+        })
+        .await;
+        scan.stop(); // stop the radio before connecting to anything
+
+        // A scan grants nothing, so each sighting is adopted into a device
+        // with the grant it will need once connected.
+        let grant = muse_grant()?;
+        let mut found = vec![];
+        for (id, candidate) in seen {
+            let name = candidate.label().to_owned();
+            match bluetooth.adopt_candidate(&candidate, grant.clone()).await {
+                Ok(device) => found.push(MuseDevice { name, id, device }),
+                Err(e) => warn!("scan_all: {name} ({id}) could not be adopted: {e}"),
             }
         }
         info!("scan_all: {} device(s) found", found.len());
@@ -305,8 +352,7 @@ impl MuseClient {
         &self,
         device: MuseDevice,
     ) -> Result<(mpsc::Receiver<MuseEvent>, MuseHandle)> {
-        self.setup_peripheral(device.peripheral, device.name, device.adapter)
-            .await
+        self.setup_device(device.device, device.name).await
     }
 
     // ── Public: connect (convenience) ────────────────────────────────────────
@@ -316,159 +362,114 @@ impl MuseClient {
     /// Equivalent to calling [`MuseClient::scan_all`] and then [`MuseClient::connect_to`]
     /// on the first result. Useful when only one headset is expected.
     pub async fn connect(&self) -> Result<(mpsc::Receiver<MuseEvent>, MuseHandle)> {
-        let manager = Manager::new().await?;
-        let adapters = manager.adapters().await?;
-        let adapter = adapters
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("No Bluetooth adapter found"))?;
-
-        // macOS: wait for CBCentralManager to reach poweredOn (same as scan_all)
-        #[cfg(target_os = "macos")]
-        {
-            use btleplug::api::CentralState;
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                match adapter.adapter_state().await {
-                    Ok(CentralState::PoweredOn) => break,
-                    Ok(_) if tokio::time::Instant::now() >= deadline => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+        let bluetooth = Bluetooth::shared();
+        bluetooth
+            .availability()
+            .await
+            .context("Bluetooth is not usable")?;
 
         info!(
             "Scanning for Muse devices (timeout: {} s) …",
             self.config.scan_timeout_secs
         );
-        adapter.start_scan(ScanFilter::default()).await?;
-        let peripheral = self
-            .find_first(&adapter, &self.config.name_prefix, self.config.scan_timeout_secs)
-            .await?;
-        adapter.stop_scan().await.ok();
+        // `FirstMatch` returns as soon as something matching advertises, so
+        // the timeout is a deadline rather than a fixed scan window.
+        let chooser = FirstMatch::with_timeout(Duration::from_secs(self.config.scan_timeout_secs));
+        let device = bluetooth
+            .request_device_with(request_options(&self.config.name_prefix)?, &chooser)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "No Muse device found within {} s: {e}",
+                    self.config.scan_timeout_secs
+                )
+            })?;
 
-        let props = peripheral.properties().await?.unwrap_or_default();
-        let device_name = props.local_name.unwrap_or_else(|| "Unknown".into());
+        let device_name = device.name().unwrap_or_else(|| device.id().to_owned());
         info!("Found device: {device_name}");
 
-        self.setup_peripheral(peripheral, device_name, adapter)
-            .await
+        self.setup_device(device, device_name).await
     }
 
-    // ── Private: setup_peripheral ─────────────────────────────────────────────
+    // ── Private: setup_device ─────────────────────────────────────────────────
 
-    /// Connect a peripheral, subscribe to all enabled GATT characteristics,
-    /// spawn the notification dispatch task, and return the event channel.
-    async fn setup_peripheral(
+    /// Connect a device, subscribe to all enabled GATT characteristics, spawn
+    /// the notification dispatch task, and return the event channel.
+    async fn setup_device(
         &self,
-        peripheral: Peripheral,
+        device: BluetoothDevice,
         device_name: String,
-        adapter: Adapter,
     ) -> Result<(mpsc::Receiver<MuseEvent>, MuseHandle)> {
-        // Hard timeout on connect(): BlueZ's org.bluez.Device1.Connect can block
-        // forever when the device is out of range or the stack is in a bad state.
-        // Ten seconds is generous for a BLE connection that typically takes <2 s.
-        tokio::time::timeout(Duration::from_secs(10), peripheral.connect())
+        let gatt = device.gatt();
+
+        // `connect()` has no deadline of its own — it waits for the peripheral
+        // to come into range for as long as that takes — so one is imposed
+        // here.  Ten seconds is generous for a BLE connection that usually
+        // takes under two.
+        tokio::time::timeout(Duration::from_secs(10), gatt.connect())
             .await
             .map_err(|_| anyhow!("BLE connect() timed out after 10 s"))??;
 
-        // On Linux (bluez-async / D-Bus) the BLE stack signals connection
-        // completion before the remote GATT service cache is populated.
-        // Calling discover_services() too quickly can return an empty set,
-        // causing every find_char() call to fail with "Characteristic not found".
-        // A short pause lets the kernel / BlueZ finish GATT discovery first.
-        #[cfg(target_os = "linux")]
-        tokio::time::sleep(Duration::from_millis(600)).await;
-
-        tokio::time::timeout(Duration::from_secs(15), peripheral.discover_services())
-            .await
-            .map_err(|_| anyhow!("discover_services() timed out after 15 s"))??;
+        // Every Muse characteristic lives under the one vendor service, so a
+        // single discovery pass produces the whole set.
+        let service = tokio::time::timeout(
+            Duration::from_secs(15),
+            gatt.get_primary_service(MUSE_SERVICE_UUID),
+        )
+        .await
+        .map_err(|_| anyhow!("service discovery timed out after 15 s"))??;
+        let chars = service.get_characteristics(None).await?;
         info!("Connected and services discovered: {device_name}");
-
-        let chars: BTreeSet<Characteristic> = peripheral.characteristics();
-
-        let find_char = |uuid: Uuid| -> Result<Characteristic> {
-            chars
-                .iter()
-                .find(|c| c.uuid == uuid)
-                .cloned()
-                .ok_or_else(|| anyhow!("Characteristic {uuid} not found"))
-        };
 
         // ── Detect Athena firmware ─────────────────────────────────────────────
         // Athena (new Muse S) exposes a universal sensor char (0x273e0013…)
         // that carries all data in tag-based packets.  Classic Muse devices do
         // not have this characteristic.
-        let is_athena = chars.iter().any(|c| c.uuid == ATHENA_SENSOR_CHARACTERISTIC);
+        let athena_uuid = BluetoothUuid::from(ATHENA_SENSOR_CHARACTERISTIC);
+        let is_athena = chars.iter().any(|c| *c.uuid() == athena_uuid);
         info!(
             "{device_name}: firmware detected as {}",
             if is_athena { "Athena" } else { "Classic" }
         );
 
         // ── Common control characteristic ──────────────────────────────────────
-        let control_char = find_char(CONTROL_CHARACTERISTIC)?;
-        peripheral.subscribe(&control_char).await?;
+        let control_char = find_char(&chars, CONTROL_CHARACTERISTIC)?;
+        let mut streams = vec![subscribe_tagged(&chars, CONTROL_CHARACTERISTIC).await?];
 
         // ── Event channel ─────────────────────────────────────────────────────
         let (tx, rx) = mpsc::channel::<MuseEvent>(256);
         let _ = tx.send(MuseEvent::Connected(device_name.clone())).await;
 
         // ── Disconnect watcher ──────────────────────────────────────────────
-        // Listen on the adapter's CentralEvent stream for DeviceDisconnected.
-        // This fires reliably when the BLE link drops (headset powered off,
-        // out of range, etc.) — often faster than waiting for the notification
-        // stream to close.
+        // Fires when the BLE link drops (headset powered off, out of range,
+        // and so on) — often sooner than the notification streams close.
         let disconnect_tx = tx.clone();
-        let peripheral_id = peripheral.id();
+        let device_id = device.id().to_owned();
+        let mut disconnects = device.watch_disconnect();
         tokio::spawn(async move {
-            match adapter.events().await {
-                Ok(mut events) => {
-                    while let Some(event) = events.next().await {
-                        if let CentralEvent::DeviceDisconnected(id) = event {
-                            if id == peripheral_id {
-                                info!("Disconnect watcher: device {id:?} disconnected.");
-                                let _ = disconnect_tx.send(MuseEvent::Disconnected).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Disconnect watcher: could not subscribe to adapter events: {e}");
-                }
+            if disconnects.next().await.is_some() {
+                info!("Disconnect watcher: device {device_id} disconnected.");
+                let _ = disconnect_tx.send(MuseEvent::Disconnected).await;
             }
         });
 
-        let peripheral_clone = peripheral.clone();
-
         if is_athena {
             // ── Athena: subscribe to the single universal sensor characteristic ─
-            let sensor_char = find_char(ATHENA_SENSOR_CHARACTERISTIC)?;
-            peripheral.subscribe(&sensor_char).await?;
+            streams.push(subscribe_tagged(&chars, ATHENA_SENSOR_CHARACTERISTIC).await?);
+            let mut notifications = select_all(streams);
 
             tokio::spawn(async move {
-                let mut notifications = match peripheral_clone.notifications().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("Athena: could not get notifications stream: {e}");
-                        return;
-                    }
-                };
                 info!("Athena: notification stream subscribed, waiting for data…");
                 let mut ctrl_acc = ControlAccumulator::new();
                 let mut notif_count: u64 = 0;
                 let mut sensor_count: u64 = 0;
                 let mut eeg_event_count: u64 = 0;
 
-                while let Some(notif) = notifications.next().await {
-                    let data = &notif.value;
+                while let Some((uuid, data)) = notifications.next().await {
+                    let data = &data[..];
                     notif_count += 1;
 
-                    if notif.uuid == CONTROL_CHARACTERISTIC {
+                    if uuid == CONTROL_CHARACTERISTIC {
                         let fragment = decode_response(data);
                         debug!("Athena control fragment: {:?}", fragment);
                         if let Some(json_str) = ctrl_acc.push(&fragment) {
@@ -493,14 +494,17 @@ impl MuseClient {
                     // All sensor data arrives on ATHENA_SENSOR_CHARACTERISTIC
                     sensor_count += 1;
                     let events = parse_athena_notification(data);
-                    let n_eeg = events.iter().filter(|e| matches!(e, MuseEvent::Eeg(_))).count();
+                    let n_eeg = events
+                        .iter()
+                        .filter(|e| matches!(e, MuseEvent::Eeg(_)))
+                        .count();
                     eeg_event_count += n_eeg as u64;
 
-                    if sensor_count <= 3 || sensor_count % 500 == 0 {
+                    if sensor_count <= 3 || sensor_count.is_multiple_of(500) {
                         info!(
                             "Athena sensor: notif #{notif_count} sensor #{sensor_count} \
                              uuid={} len={} events={} eeg={} (total eeg: {eeg_event_count})",
-                            notif.uuid,
+                            uuid,
                             data.len(),
                             events.len(),
                             n_eeg,
@@ -545,27 +549,22 @@ impl MuseClient {
             });
         } else {
             // ── Classic Muse: separate characteristic per sensor ───────────────
-            let telemetry_char = find_char(TELEMETRY_CHARACTERISTIC)?;
-            peripheral.subscribe(&telemetry_char).await?;
-
-            let accel_char = find_char(ACCELEROMETER_CHARACTERISTIC)?;
-            peripheral.subscribe(&accel_char).await?;
-
-            let gyro_char = find_char(GYROSCOPE_CHARACTERISTIC)?;
-            peripheral.subscribe(&gyro_char).await?;
+            streams.push(subscribe_tagged(&chars, TELEMETRY_CHARACTERISTIC).await?);
+            streams.push(subscribe_tagged(&chars, ACCELEROMETER_CHARACTERISTIC).await?);
+            streams.push(subscribe_tagged(&chars, GYROSCOPE_CHARACTERISTIC).await?);
 
             let num_eeg = if self.config.enable_aux { 5 } else { 4 };
             for &eeg_uuid in &EEG_CHARACTERISTICS[..num_eeg] {
-                match find_char(eeg_uuid) {
-                    Ok(c) => peripheral.subscribe(&c).await?,
+                match subscribe_tagged(&chars, eeg_uuid).await {
+                    Ok(s) => streams.push(s),
                     Err(e) => warn!("EEG char {eeg_uuid}: {e}"),
                 }
             }
 
             if self.config.enable_ppg {
                 for &ppg_uuid in &PPG_CHARACTERISTICS {
-                    match find_char(ppg_uuid) {
-                        Ok(c) => peripheral.subscribe(&c).await?,
+                    match subscribe_tagged(&chars, ppg_uuid).await {
+                        Ok(s) => streams.push(s),
                         Err(e) => warn!("PPG char {ppg_uuid}: {e}"),
                     }
                 }
@@ -573,15 +572,9 @@ impl MuseClient {
 
             let enable_ppg = self.config.enable_ppg;
             let enable_aux = self.config.enable_aux;
+            let mut notifications = select_all(streams);
 
             tokio::spawn(async move {
-                let mut notifications = match peripheral_clone.notifications().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("Classic: could not get notifications stream: {e}");
-                        return;
-                    }
-                };
                 info!("Classic: notification stream subscribed, waiting for data…");
                 let mut notif_count: u64 = 0;
 
@@ -591,11 +584,10 @@ impl MuseClient {
                     (0..3).map(|_| TimestampTracker::new()).collect();
                 let mut ctrl_acc = ControlAccumulator::new();
 
-                while let Some(notif) = notifications.next().await {
-                    let data = &notif.value;
-                    let uuid = notif.uuid;
+                while let Some((uuid, data)) = notifications.next().await {
+                    let data = &data[..];
                     notif_count += 1;
-                    if notif_count <= 5 || notif_count % 500 == 0 {
+                    if notif_count <= 5 || notif_count.is_multiple_of(500) {
                         info!(
                             "Classic: notif #{notif_count} uuid={uuid} len={}",
                             data.len()
@@ -706,43 +698,12 @@ impl MuseClient {
         }
 
         let handle = MuseHandle {
-            peripheral,
+            gatt,
             control_char,
             is_athena,
         };
 
         Ok((rx, handle))
-    }
-
-    // ── Private: find_first ───────────────────────────────────────────────────
-
-    /// Poll until the first matching peripheral appears or the timeout expires.
-    async fn find_first(
-        &self,
-        adapter: &btleplug::platform::Adapter,
-        prefix: &str,
-        timeout_secs: u64,
-    ) -> Result<Peripheral> {
-        use tokio::time::{sleep, timeout};
-
-        let result = timeout(Duration::from_secs(timeout_secs), async {
-            loop {
-                let peripherals = adapter.peripherals().await.unwrap_or_default();
-                for p in peripherals {
-                    if let Ok(Some(props)) = p.properties().await {
-                        if let Some(name) = &props.local_name {
-                            if name.starts_with(prefix) {
-                                return p;
-                            }
-                        }
-                    }
-                }
-                sleep(Duration::from_millis(250)).await;
-            }
-        })
-        .await;
-
-        result.map_err(|_| anyhow!("Timed out scanning for a Muse device after {timeout_secs} s"))
     }
 }
 
@@ -750,8 +711,8 @@ impl MuseClient {
 
 /// A handle to an active Muse connection that lets you send control commands.
 pub struct MuseHandle {
-    peripheral: Peripheral,
-    control_char: Characteristic,
+    gatt: RemoteGattServer,
+    control_char: RemoteGattCharacteristic,
     /// `true` when the connected device runs the Athena firmware (new Muse S).
     pub is_athena: bool,
 }
@@ -760,8 +721,8 @@ impl MuseHandle {
     /// Send a raw command string (e.g. `"h"`, `"d"`, `"p21"`).
     pub async fn send_command(&self, cmd: &str) -> Result<()> {
         let payload = encode_command(cmd);
-        self.peripheral
-            .write(&self.control_char, &payload, WriteType::WithoutResponse)
+        self.control_char
+            .write_value_without_response(&payload)
             .await?;
         Ok(())
     }
@@ -802,11 +763,40 @@ impl MuseHandle {
     ///
     /// # Athena startup sequence
     ///
-    /// `v4` → `s` → `h` → `p1045` → `dc001` × 2 → `L1` → **2 s wait**
+    /// `v4` → `s` → `h` → *preset* → `dc001` × 2 → `L1` → **2 s wait**
     ///
-    /// The `enable_ppg` and `enable_aux` flags are ignored for Athena; the
-    /// firmware always uses preset `p1045`.  The 2-second wait at the end is
-    /// required by the Athena firmware before packets actually start flowing.
+    /// | `enable_ppg` | Preset | Streams |
+    /// |---|---|---|
+    /// | true (default) | `p1041` | 8-channel EEG + 16-channel optical |
+    /// | false | `p1045` | 8-channel EEG + 4-channel optical |
+    ///
+    /// `enable_aux` has no effect here: Athena's eight channels already
+    /// include the auxiliary inputs, which is what AUX selects on Classic.
+    ///
+    /// **Optical cannot be switched off on Athena.** Every preset tried
+    /// carries it, so `enable_ppg: false` selects the narrowest mode rather
+    /// than silence. Only the Classic presets (`p21`) have none, and they drop
+    /// EEG to four channels.
+    ///
+    /// The whole table is measurement, not documentation — every preset
+    /// switched on a Muse S Athena (fw 3.1.11), counting what arrived:
+    ///
+    /// | preset | EEG | optical |
+    /// |---|---|---|
+    /// | `p1041`, `p1042` | 8ch | 16ch (`0x36`) |
+    /// | `p1043`, `p1044` | 8ch | 8ch (`0x35`) |
+    /// | `p1045`, `p1046` | 8ch | 4ch (`0x34`) |
+    /// | `p1034` | 4ch | 8ch (`0x35`) |
+    /// | `p1035` | 4ch | 4ch (`0x34`) |
+    /// | `p21` | 4ch | none |
+    ///
+    /// Per-channel rate is the same across optical modes — 16 channels carry
+    /// one sample per packet where 8 carry two — so the wider mode is more
+    /// data rather than the same data rearranged. The previous default,
+    /// `p1045`, asked for the *narrowest* optical mode of the three.
+    ///
+    /// The 2-second wait at the end is required by the Athena firmware before
+    /// packets actually start flowing.
     pub async fn start(&self, enable_ppg: bool, enable_aux: bool) -> Result<()> {
         if self.is_athena {
             // Athena startup — mirrors MuseAthenaClient.start() in muse-jsx.
@@ -823,7 +813,11 @@ impl MuseHandle {
             delay(100).await;
             self.send_command("h").await?;
             delay(100).await;
-            self.send_command("p1045").await?;
+            // The richest mode the device offers, rather than a fixed preset:
+            // `p1041` carries sixteen optical channels where `p1045` carries
+            // four, at the same per-channel rate.
+            let preset = if enable_ppg { "p1041" } else { "p1045" };
+            self.send_command(preset).await?;
             delay(100).await;
             // Athena data-start: send dc001 twice (per TypeScript reference),
             // then also send Classic `d` as fallback for fw 3.x which rejects
@@ -865,12 +859,12 @@ impl MuseHandle {
     /// to detect disconnects faster than waiting for the notification stream
     /// to close.
     pub async fn is_connected(&self) -> bool {
-        self.peripheral.is_connected().await.unwrap_or(false)
+        self.gatt.connected()
     }
 
     /// Gracefully disconnect.
     pub async fn disconnect(&self) -> Result<()> {
-        self.peripheral.disconnect().await?;
+        self.gatt.disconnect();
         Ok(())
     }
 }

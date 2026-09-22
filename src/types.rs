@@ -56,10 +56,17 @@ pub struct EegReading {
 pub struct PpgReading {
     /// Sequential packet index (wraps at 0xFFFF), same purpose as [`EegReading::index`].
     pub index: u16,
-    /// Optical channel:
+    /// Optical channel.
+    ///
     /// * 0 = ambient (background light subtraction)
     /// * 1 = infrared
     /// * 2 = red
+    ///
+    /// **Classic** stops there. **Athena** carries four, eight or sixteen
+    /// channels depending on the preset, and every one of them is reported —
+    /// see [`crate::protocol::ppg_channel_name`]. The roles of the channels
+    /// past `red` are not documented, so they are named by index; they do
+    /// carry real signal.
     pub ppg_channel: usize,
     /// Wall-clock timestamp in milliseconds since Unix epoch for the first sample.
     pub timestamp: f64,
@@ -188,8 +195,9 @@ pub enum MuseEvent {
     Eeg(EegReading),
     /// A PPG (photoplethysmography) optical packet.
     ///
-    /// Classic requires `enable_ppg: true` in [`crate::muse_client::MuseClientConfig`].
-    /// Athena optical data is always included with preset `p1045`.
+    /// Requires `enable_ppg: true` in [`crate::muse_client::MuseClientConfig`]
+    /// on both firmwares — on Athena that selects a preset carrying optical
+    /// channels (`p1044`) over one that does not (`p1041`).
     Ppg(PpgReading),
     /// Battery and housekeeping telemetry (~1 Hz).
     ///

@@ -462,9 +462,9 @@ fn spawn_simulator(app: Arc<Mutex<App>>) {
 
 /// Start a background scan; return a receiver for the results.
 ///
-/// The task has a hard deadline of `scan_timeout + 10 s` to guard against
-/// `Manager::new()` or `adapter.start_scan()` hanging indefinitely inside
-/// btleplug when the Bluetooth stack is in a bad state.
+/// The task has a hard deadline of `scan_timeout + 10 s` to guard against the
+/// adapter never settling — `availability()` waits for the first state report,
+/// which never arrives when the Bluetooth stack is in a bad state.
 /// Scan result delivered through the oneshot channel.
 struct ScanResult {
     devices: Vec<MuseDevice>,

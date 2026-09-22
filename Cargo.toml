@@ -1,8 +1,11 @@
 [package]
 name          = "muse-rs"
-version       = "0.1.0"
+version       = "0.2.0"
 edition       = "2021"
-description   = "Rust client for Muse EEG headsets over BLE using btleplug"
+# webbluetooth requires it, so this crate does too — declared rather than
+# discovered halfway through a build.
+rust-version  = "1.94"
+description   = "Rust client for Muse EEG headsets over BLE using the Web Bluetooth API"
 keywords      = ["exg", "eeg", "ppg", "imu", "muse"]
 authors       = ["Eugene Hauptmann"]
 license-file  = "LICENSE"
@@ -48,10 +51,11 @@ tui     = ["dep:ratatui", "dep:crossterm"]
 # ── Core library dependencies ─────────────────────────────────────────────────
 
 [dependencies]
-btleplug   = "0.11.8"
+# The `uuid` feature lets `protocol`'s `Uuid` constants be passed straight in,
+# with no conversion at the call sites.
+webbluetooth = { version = "0.0.1", features = ["uuid"] }
 tokio      = { version = "1", features = ["full"] }
 uuid       = { version = "1", features = ["v4"] }
-futures    = "0.3"
 log        = "0.4"
 env_logger = "0.11"
 serde      = { version = "1", features = ["derive"] }
@@ -63,11 +67,3 @@ anyhow     = "1"
 ratatui   = { version = "0.30.0", features = ["crossterm"], optional = true }
 crossterm = { version = "0.29", optional = true }
 
-# ── Patch ──────────────────────────────────────────────────────────────────────
-# Use a fork of btleplug with improved macOS disconnect handling, expanded
-# broadcast channel buffers, and null-safety fixes.  The crates.io dependency
-# above keeps `cargo publish` happy; the patch overrides it at build time.
-# See: https://github.com/eugenehp/btleplug/tree/imrpoved_mac_version
-
-[patch.crates-io]
-btleplug = { git = "https://github.com/eugenehp/btleplug.git", branch = "imrpoved_mac_version" }

@@ -107,8 +107,14 @@ pub mod prelude {
 
     // ── Protocol constants ────────────────────────────────────────────────────
     pub use crate::protocol::{
-        ATHENA_PPG_CHANNELS, ATHENA_PPG_FREQUENCY, ATHENA_PPG_SAMPLES_PER_PKT,
-        EEG_CHANNEL_NAMES, EEG_FREQUENCY, EEG_SAMPLES_PER_READING, PPG_CHANNEL_NAMES,
-        PPG_FREQUENCY, PPG_SAMPLES_PER_READING,
+        ATHENA_EEG_CHANNEL_NAMES, ATHENA_PPG_CHANNELS, ATHENA_PPG_CHANNEL_NAMES,
+        ATHENA_PPG_FREQUENCY, ATHENA_PPG_SAMPLES_PER_PKT, EEG_CHANNEL_NAMES, EEG_FREQUENCY,
+        EEG_SAMPLES_PER_READING, PPG_CHANNEL_NAMES, PPG_FREQUENCY, PPG_SAMPLES_PER_READING,
     };
+
+    // ── Naming helpers ────────────────────────────────────────────────────────
+    // Prefer these to indexing the tables directly: the Classic and Athena
+    // electrode orders diverge at index 4, so one table applied to the other
+    // firmware's data prints a wrong name rather than no name.
+    pub use crate::protocol::{eeg_channel_name, ppg_channel_name};
 }

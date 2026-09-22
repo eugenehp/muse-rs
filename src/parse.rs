@@ -413,7 +413,10 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             //                                  s1_ch0, … s3_ch3]
             0x11 => {
                 let end = payload_start + 28;
-                if end > data.len() { idx += 1; continue; }
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let raw = parse_uint_le_bits(&data[payload_start..end], 14);
                 // 16 values = 4 samples × 4 channels (sample-major per OpenMuse)
                 let n_ch = 4usize;
@@ -437,7 +440,10 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // 8 channels × 2 samples, 14-bit LE unsigned, sample-major layout.
             0x12 => {
                 let end = payload_start + 28;
-                if end > data.len() { idx += 1; continue; }
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let raw = parse_uint_le_bits(&data[payload_start..end], 14);
                 let n_ch = 8usize;
                 let n_samp = 2usize;
@@ -461,11 +467,14 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // 30 bytes → 12 values, sample-major: [s0_ch0..s0_ch3, s1_ch0..]
             0x34 => {
                 let end = payload_start + 30;
-                if end > data.len() { idx += 1; continue; }
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let raw = parse_uint_le_bits(&data[payload_start..end], 20);
                 let n_ch = 4usize;
                 let n_samp = 3usize;
-                for ch in 0..n_ch.min(3) {
+                for ch in 0..n_ch {
                     let samples: Vec<u32> = (0..n_samp)
                         .filter_map(|s| raw.get(s * n_ch + ch).copied())
                         .collect();
@@ -483,11 +492,14 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // 2 samples × 8 channels, 20-bit LE unsigned.  40 bytes → 16 values.
             0x35 => {
                 let end = payload_start + 40;
-                if end > data.len() { idx += 1; continue; }
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let raw = parse_uint_le_bits(&data[payload_start..end], 20);
                 let n_ch = 8usize;
                 let n_samp = 2usize;
-                for ch in 0..n_ch.min(3) {
+                for ch in 0..n_ch {
                     let samples: Vec<u32> = (0..n_samp)
                         .filter_map(|s| raw.get(s * n_ch + ch).copied())
                         .collect();
@@ -505,8 +517,35 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // 1 sample × 16 channels, 20-bit LE unsigned.  40 bytes → 16 values.
             0x36 => {
                 let end = payload_start + 40;
-                if end > data.len() { idx += 1; continue; }
-                // Skip: 16-channel optical layout not yet mapped to PpgReading.
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
+                // Confirmed against hardware: presets p1041 and p1042 select
+                // this mode on fw 3.1.11. It used to be skipped outright, which
+                // is why those two presets looked like they carried no optical
+                // data at all — they carry the most of any preset.
+                //
+                // The layout is confirmed by the shape of the result rather
+                // than assumed: de-interleaved this way, each of the sixteen
+                // channels holds a steady DC level of its own (spreads of
+                // 99-4404 over five seconds) and they fall into consecutive
+                // pairs. A wrong stride would smear channels together and show
+                // every one of them swinging across the whole range.
+                let raw = parse_uint_le_bits(&data[payload_start..end], 20);
+                let n_ch = 16usize;
+                let n_samp = 1usize;
+                for ch in 0..n_ch {
+                    let samples: Vec<u32> = (0..n_samp)
+                        .filter_map(|s| raw.get(s * n_ch + ch).copied())
+                        .collect();
+                    events.push(MuseEvent::Ppg(PpgReading {
+                        index: 0,
+                        ppg_channel: ch,
+                        timestamp: 0.0,
+                        samples,
+                    }));
+                }
                 idx = end;
             }
 
@@ -514,31 +553,40 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // 3 samples × (ACC[3] + GYRO[3]), 16-bit LE signed, 36 bytes.
             0x47 => {
                 let end = payload_start + 36;
-                if end > data.len() { idx += 1; continue; }
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let vals: Vec<i16> = data[payload_start..end]
                     .chunks_exact(2)
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
-                if vals.len() >= 6 {
+                // 36 bytes is eighteen i16s: three samples of accelerometer
+                // xyz followed by gyroscope xyz, interleaved per sample. Only
+                // the first was decoded before, and the other two slots were
+                // filled by copying it — so `samples` claimed three readings
+                // and carried one, and two thirds of the motion data was
+                // dropped on the floor at every packet.
+                if vals.len() >= 18 {
                     const AS: f32 = 0.0000610352;
                     const GS: f32 = -0.0074768;
-                    let acc = XyzSample {
-                        x: vals[0] as f32 * AS,
-                        y: vals[1] as f32 * AS,
-                        z: vals[2] as f32 * AS,
+                    let accel = |i: usize| XyzSample {
+                        x: vals[i * 6] as f32 * AS,
+                        y: vals[i * 6 + 1] as f32 * AS,
+                        z: vals[i * 6 + 2] as f32 * AS,
                     };
-                    let gyro = XyzSample {
-                        x: vals[3] as f32 * GS,
-                        y: vals[4] as f32 * GS,
-                        z: vals[5] as f32 * GS,
+                    let gyro = |i: usize| XyzSample {
+                        x: vals[i * 6 + 3] as f32 * GS,
+                        y: vals[i * 6 + 4] as f32 * GS,
+                        z: vals[i * 6 + 5] as f32 * GS,
                     };
                     events.push(MuseEvent::Accelerometer(ImuData {
                         sequence_id: 0,
-                        samples: [acc, acc, acc],
+                        samples: [accel(0), accel(1), accel(2)],
                     }));
                     events.push(MuseEvent::Gyroscope(ImuData {
                         sequence_id: 0,
-                        samples: [gyro, gyro, gyro],
+                        samples: [gyro(0), gyro(1), gyro(2)],
                     }));
                 }
                 idx = end;
@@ -557,7 +605,10 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // Since the payload length varies, consume everything up to the
             // packet boundary indicated by byte[0] (pkt_len).
             0x88 => {
-                if payload_start + 2 > data.len() { idx += 1; continue; }
+                if payload_start + 2 > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let raw = u16::from_le_bytes([data[payload_start], data[payload_start + 1]]);
                 let battery_level = (raw as f32 / 256.0).clamp(0.0, 100.0);
                 events.push(MuseEvent::Telemetry(TelemetryData {
@@ -577,7 +628,10 @@ pub fn parse_athena_notification(data: &[u8]) -> Vec<MuseEvent> {
             // matching control JSON `bp` field).
             0x98 => {
                 let end = payload_start + 20;
-                if end > data.len() { idx += 1; continue; }
+                if end > data.len() {
+                    idx += 1;
+                    continue;
+                }
                 let raw = u16::from_le_bytes([data[payload_start], data[payload_start + 1]]);
                 let battery_level = (raw as f32 / 256.0).clamp(0.0, 100.0);
                 events.push(MuseEvent::Telemetry(TelemetryData {

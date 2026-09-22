@@ -1,3 +1,88 @@
+# v0.2.0 — 2026-09-21
+
+**If you decode Athena data, read "Fixed" first: this release changes what
+arrives.** More optical channels, more IMU samples, and one electrode that was
+labelled wrongly. The `MuseClient` / `MuseDevice` / `MuseHandle` API itself is
+unchanged.
+
+## Fixed
+
+Every one of these was found by running against a Muse S Athena (fw 3.1.11) and
+comparing what the device sent with what the library emitted. None were visible
+from a green test suite — the data was arriving and being discarded at the last
+step.
+
+- **Optical channels were being thrown away.** The 4- and 8-channel optical
+  handlers ended in `for ch in 0..n_ch.min(3)`: the count was decoded
+  correctly, then everything past the third channel was dropped before an event
+  was built. The clamp was sized to `PPG_CHANNEL_NAMES`, so a naming table was
+  silently constraining the data. In 8-channel mode that discarded 5 of 8
+  channels; all of them carry real signal, each with its own DC level.
+- **The 16-channel optical mode was skipped entirely** (`0x36`), which made
+  presets `p1041` and `p1042` look like they carried no optical data at all.
+  They carry the most of any preset. Decoding is confirmed by the result's
+  shape: de-interleaved this way each of the sixteen channels holds a steady
+  level of its own, where a wrong stride smears them together.
+- **Two thirds of the IMU data was discarded.** An Athena IMU packet is 36
+  bytes — three accelerometer and gyroscope triples — and only the first was
+  decoded; the other two slots were filled by *copying* it, so `samples`
+  reported three readings and carried one. Measured rate goes from an apparent
+  26 Hz to the documented 52 Hz, and the samples are now distinct.
+- **Athena's fifth electrode was labelled wrongly.** `EEG_CHANNEL_NAMES` is the
+  Classic mapping, where index 4 is AUX; on Athena it is FPz. Applied to Athena
+  data it did not run out of names, it printed a wrong one. Use the new
+  firmware-aware `protocol::eeg_channel_name`.
+
+## Changed
+
+- **Athena's startup preset is now `p1041`, not `p1045`.** Measured across every
+  preset the firmware accepts, `p1045` selects the *narrowest* optical mode —
+  four channels — while `p1041` carries sixteen at the same per-channel rate.
+  `enable_ppg: false` now selects `p1045` rather than being ignored. Optical
+  cannot be switched off on Athena; no preset has none.
+- **BLE backend is now [webbluetooth](https://github.com/eugenehp/webbluetooth)**
+
+ instead of the btleplug fork — a Rust port of the Web Bluetooth API, talking to CoreBluetooth, BlueZ, WinRT, Android and the browser through one surface.
+  - The macOS "wait for `CBCentralManager` to reach poweredOn" polling loops are gone; `Bluetooth::availability()` waits for the adapter's first state report, and reports *why* it is unusable when it is not.
+  - Disconnects come from `BluetoothDevice::watch_disconnect()` — per device, rather than filtering an adapter-wide event stream.
+  - Notifications are subscribed per characteristic and merged, so a missing EEG or PPG characteristic no longer silently joins the same stream as everything else.
+  - Access is scoped to the Muse vendor service `0000fe8d-…` by the Web Bluetooth grant model; the GATT blocklist is enforced.
+  - The `[patch.crates-io]` override of `btleplug` is gone.
+  - One adapter session per process, via `Bluetooth::shared()`. A device is
+    only usable through the session that found it, and the TUI scans with one
+    `MuseClient` and connects with another — so this is load-bearing rather
+    than tidiness.
+  - The `Uuid` constants in `protocol` are passed to webbluetooth unconverted,
+    through its `uuid` feature. There is no conversion helper in this crate any
+    more, and no `expect` for a value that cannot be wrong.
+
+## Added
+
+- **`muse-rs scan` and `muse-rs info`.** The CLI took no arguments at all: it
+  connected to whichever device answered first and printed every event. `scan`
+  lists what is in range; `info` connects and reports the firmware, battery,
+  preset and — the point — the channels that actually arrived, by name and
+  rate. On an Athena headset that is 8 EEG channels and 16 optical ones, which
+  was previously discoverable only by reading 50,000 lines of output.
+- **Arguments**: `--device`, `--prefix`, `--timeout`, `--no-ppg`, `--aux`,
+  `--preset`, `--raw`, `--help`.
+- **`stream` summarises by default**, once a second, with per-channel rates and
+  live values. Athena sends ~1,400 events a second across 24 channels; a line
+  each is not output, it is a denial of service. `--raw` restores the old dump.
+- **Electrode contact.** `info` reports, per electrode, the share of samples
+  pinned at the converter's range limit — which is clipping rather than a
+  voltage, and is what an electrode not touching skin does. `stream` names the
+  offenders live. The threshold comes from each firmware's own decode
+  arithmetic: ±725 µV on Athena, ±1000 µV on Classic.
+- `protocol::ATHENA_EEG_CHANNEL_NAMES`, `eeg_channel_name`, `ppg_channel_name`.
+
+## Removed
+
+- The `futures` dependency. It was one import — `stream::{self, BoxStream,
+  StreamExt}` — and `webbluetooth::stream` re-exports all of it, so the
+  notification-merging code is unchanged and the dependency is gone from
+  `cargo tree` entirely.
+
 # v0.1.0
 
 First feature-complete release of `muse-rs` — an async Rust library and terminal UI for streaming real-time sensor data from Interaxon Muse EEG headsets over Bluetooth Low Energy.
