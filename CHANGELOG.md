@@ -1,9 +1,70 @@
-# v0.2.1 — 2026-09-27
+# v0.2.1 — 2026-09-28
 
-Dependency-only release: `webbluetooth` 0.0.1 → 0.0.2. Nothing in this crate's
-own API or behaviour changes.
+**The library now runs in a browser.** `webbluetooth` 0.0.1 → 0.0.3, and the
+crate builds and works on `wasm32-unknown-unknown` — with a web front end in
+`examples/web` alongside the TUI and the console streamer. The public API is
+unchanged on every existing target.
+
+## Added
+
+- **Browser support, end to end.** `cargo build --target
+  wasm32-unknown-unknown` now produces a working library, with no feature flags
+  to remember. The decoding, firmware detection and electrode mapping are the
+  same code the TUI runs.
+
+  Spawning and timers are the part that could not be shared: tokio's timer is
+  not implemented for `wasm32-unknown-unknown` — tokio's own suite marks
+  building a runtime with `time` enabled `#[should_panic]` there — and its
+  multi-threaded scheduler has no threads. The new internal `platform` module
+  routes both per target: tokio natively, and in a browser
+  `webbluetooth-wasm`'s `exec::spawn` and the shim's `SET_TIMEOUT`, which is
+  `setTimeout` over the same request/settle path as every BLE call. No new
+  third-party dependency; internal, so nothing is added to the public API.
+
+- **`examples/web`** — a page that streams from a headset over the browser's
+  own Web Bluetooth. One row per electrode plus accelerometer and gyroscope,
+  a smoothing overlay matching the TUI's 9-sample window, and all drawing in a
+  web worker on an `OffscreenCanvas` so streaming does not stall the main
+  thread. `examples/web/build.sh` builds it and lays out a directory to serve.
+
+  Every row covers the same four seconds. The streams do not share a rate — EEG
+  is 256 Hz, the IMU about 52 — so the module declares each row's rate and the
+  view sizes that row's buffer to `rate × 4 s` rather than to a fixed number of
+  samples, which would have shown five times as much history for the IMU on the
+  same x axis.
+
+## Changed
+
+- **`tokio` is no longer pulled in with `full`.** It was enabling
+  `net`/`process`/`signal`, which drag in mio, which has no wasm backend at
+  all. The features actually used are named instead: `sync` everywhere, and
+  `rt`/`rt-multi-thread`/`time`/`macros` on native targets only. Visible to
+  dependents through feature unification — anything that was implicitly getting
+  `tokio::fs` or `tokio::net` by way of this crate must now ask for it.
+
+- **`env_logger`, `ratatui` and `crossterm` are native-only**, gated by target
+  rather than only by feature. `tui` is on by default, so before this the
+  default feature set alone made the crate unbuildable for the browser; asking
+  for it on wasm is now inert. `env_logger` is reachable only from the
+  binaries, so it no longer enters a browser bundle.
+
+- **`uuid` no longer enables `v4`.** Every UUID in `protocol` is a `from_u128`
+  constant, and the random generator was the one thing forcing a randomness
+  backend to be configured on wasm.
+
+- **The two binaries are native by construction.** Each one's body moved into a
+  module behind a single `cfg` (`src/cli.rs`, `src/tui.rs`), so a wasm build
+  compiles them away instead of failing on a terminal that a page does not
+  have. Both binaries are unchanged in behaviour.
 
 ## Fixed
+
+- **Notifications never arrived in the browser.** `webbluetooth-wasm` 0.0.2
+  reported a notification's characteristic by UUID, while its own backend keys
+  subscribers and the value cache by handle path — so every notification was
+  decoded and then dropped. A page could scan, connect, discover, write, and
+  see `startNotifications()` succeed while receiving nothing. Fixed in
+  `webbluetooth` 0.0.3, which this release requires.
 
 - **Windows targets could not link.** `webbluetooth-windows` 0.0.1 declared
   `#[link(name = "combase")]`, but the Windows SDK ships no `combase.lib`: the

@@ -11,7 +11,7 @@
 //! that links and then panics on the first runtime it constructs.
 //!
 //! What a page does have is an event loop, and `webbluetooth-wasm` already
-//! speaks to it. [`exec::spawn`](webbluetooth_wasm::exec::spawn) polls a task
+//! speaks to it. `webbluetooth-wasm`'s `exec::spawn` polls a task
 //! whenever something wakes it, and the shim's `SET_TIMEOUT` operation is
 //! `setTimeout` reached over the same request/settle path as every BLE call.
 //! Both are already linked into a wasm build of this crate, so routing onto

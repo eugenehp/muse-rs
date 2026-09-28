@@ -14,6 +14,10 @@ firmware — and automatically selects the correct protocol at connection time.
 
 ![PPG view](./docs/ppg.png)
 
+## Web view
+
+![Web view](./docs/web.png)
+
 ## Installation
 
 ```shell
@@ -162,10 +166,10 @@ Use `muse-rs` as a library in your own project:
 # Cargo.toml
 
 # Full build (includes TUI feature):
-muse-rs = "0.2.0"
+muse-rs = "0.2.1"
 
 # Library only — skips ratatui / crossterm compilation:
-muse-rs = { version = "0.2.0", default-features = false }
+muse-rs = { version = "0.2.1", default-features = false }
 ```
 
 ```rust
@@ -480,6 +484,12 @@ python3 -m http.server --directory examples/web/dist 8000
 Then open <http://localhost:8000/> in Chrome or Edge and press **Connect a
 headset**. Safari and Firefox do not implement Web Bluetooth; `localhost` (or
 HTTPS) is required because it needs a secure context.
+
+![Web view](./docs/web.png)
+
+Above: a Muse S on Athena firmware — eight electrodes, named for the firmware
+that produced them, with the accelerometer and gyroscope beneath and smoothing
+on. The two large deflections in AF7 and TP10 are blinks.
 
 Nothing about the protocol is re-implemented for the browser: decoding,
 firmware detection and the Athena-vs-Classic electrode mapping are the library

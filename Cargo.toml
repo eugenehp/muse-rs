@@ -7,8 +7,14 @@ edition       = "2021"
 rust-version  = "1.94"
 description   = "Rust client for Muse EEG headsets over BLE using the Web Bluetooth API"
 keywords      = ["exg", "eeg", "ppg", "imu", "muse"]
+# Browsing categories is how someone finds this without knowing it exists.
+# `wasm` earns its place as of 0.2.1: the library runs in a page.
+categories    = ["science", "hardware-support", "wasm"]
 authors       = ["Eugene Hauptmann"]
-license-file  = "LICENSE"
+# The SPDX expression rather than `license-file`: crates.io shows a file
+# reference as a non-standard licence, and licence tooling reads the
+# expression. LICENSE is stock Apache-2.0 and ships regardless.
+license       = "Apache-2.0"
 homepage      = "https://github.com/eugenehp/muse-rs"
 repository    = "https://github.com/eugenehp/muse-rs"
 documentation = "https://docs.rs/muse-rs"
@@ -68,7 +74,7 @@ tui     = ["dep:ratatui", "dep:crossterm"]
 # consumer pinned to a different 0.0.x than this crate resolves to *two*
 # copies of the crate — and `Bluetooth::shared()` memoises into a `OnceLock`,
 # so two copies means two BLE sessions and devices that will not connect.
-webbluetooth = { version = "0.0.2", features = ["uuid"] }
+webbluetooth = { version = "0.0.3", features = ["uuid"] }
 # Only `sync`, because it is the one piece that is portable: `mpsc` is the event
 # channel handed to callers, and a channel needs no runtime underneath it. The
 # runtime and timer features are native-only (below), for the reason written up
@@ -120,9 +126,9 @@ crossterm = { version = "0.29", optional = true }
 # `SET_TIMEOUT` operation, which is `setTimeout` reached over the same
 # request/settle path as every BLE call.
 #
-# Held at the same 0.0.2 `webbluetooth` itself depends on, for a sharper version
+# Held at the same 0.0.3 `webbluetooth` itself depends on, for a sharper version
 # of the reason given further up: `exec` and `host` keep their task table and
 # their pending-request map in module-level state, so a second copy of this
 # crate would mean a second set of both — tasks spawned onto an executor that
 # nothing drives, and timers settled against tokens nobody is holding.
-webbluetooth-wasm = "0.0.2"
+webbluetooth-wasm = "0.0.3"
