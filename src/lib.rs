@@ -70,6 +70,10 @@ pub mod parse;
 pub mod protocol;
 pub mod types;
 
+// Spawning and timers differ between a native runtime and a browser event
+// loop. Internal: which one is in use is not something a caller chooses.
+mod platform;
+
 // ── Prelude ───────────────────────────────────────────────────────────────────
 
 /// Convenience re-exports for downstream crates.

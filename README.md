@@ -272,6 +272,10 @@ the link, so a headset that goes out of range is noticed either way.
 cd muse-rs
 cargo build --release          # builds lib + both binaries (tui feature on by default)
 cargo build --no-default-features  # builds lib + headless CLI only (no ratatui/crossterm)
+
+# For the browser. No feature flags needed: the TUI dependencies are gated by
+# target, and the two binaries compile away. See "Web interface" below.
+cargo build --target wasm32-unknown-unknown --release
 ```
 
 ---
@@ -462,6 +466,53 @@ cat muse-tui.log
 
 ---
 
+## Web interface (`examples/web`)
+
+The same library, in a browser, over the browser's own Web Bluetooth — a
+third front end alongside the TUI and the console streamer.
+
+```bash
+rustup target add wasm32-unknown-unknown   # once
+examples/web/build.sh
+python3 -m http.server --directory examples/web/dist 8000
+```
+
+Then open <http://localhost:8000/> in Chrome or Edge and press **Connect a
+headset**. Safari and Firefox do not implement Web Bluetooth; `localhost` (or
+HTTPS) is required because it needs a secure context.
+
+Nothing about the protocol is re-implemented for the browser: decoding,
+firmware detection and the Athena-vs-Classic electrode mapping are the library
+compiled to `wasm32-unknown-unknown`, and the page is a canvas plus about a
+hundred lines of glue. There is no `wasm-bindgen` — `webbluetooth-wasm`
+bridges to `navigator.bluetooth` through a small hand-written shim, and the
+example crosses the same boundary.
+
+The view shows one row per electrode plus accelerometer and gyroscope (three
+axes overlaid each), with an optional smoothing overlay matching the TUI's
+9-sample window. Every row covers the same four seconds: the module declares
+each row's rate, so the 52 Hz IMU and the 256 Hz EEG are drawn over the same
+span of time rather than the same number of samples.
+
+Drawing runs in a **web worker** on an `OffscreenCanvas`, so streaming does not
+obstruct the main thread. That is where the cost actually is: eight traces of a
+thousand points at 60 Hz is around half a million path operations a second,
+against roughly two thousand samples a second crossing the wasm boundary. What
+stays on the main thread is the part that cannot move — `navigator.bluetooth` is
+not exposed to workers, and `requestDevice` needs a user gesture — plus a few
+DOM writes a second.
+
+The library builds for wasm with no feature flags to remember: the TUI
+dependencies are gated by target, so the default feature set is already
+correct. Spawning and timers are the part that cannot be shared — a page has
+no tokio runtime, and tokio's timer is not implemented for
+`wasm32-unknown-unknown` — so they are routed per target in `src/platform.rs`.
+
+See [`examples/web/README.md`](examples/web/README.md) for the module's
+exports and imports, and for what to carry over into a page of your own.
+
+---
+
 ## Configuration
 
 ```rust
@@ -491,12 +542,25 @@ muse-rs/
 ├── Cargo.toml
 ├── build.rs             # macOS Info.plist embedding for CoreBluetooth
 ├── Info.plist           # NSBluetoothAlwaysUsageDescription
+├── examples/
+│   └── web/             # Browser front end (wasm32-unknown-unknown)
+│       ├── lib.rs       # cdylib: one export, and the page's imports
+│       ├── index.html   # Page: Connect button, status, canvas
+│       ├── app.js       # Main thread: Web Bluetooth, and batching samples
+│       ├── render.js    # Worker: ring buffers + OffscreenCanvas drawing
+│       ├── build.sh     # Builds the .wasm and lays out dist/ to serve
+│       └── README.md    # The module boundary, in full
 └── src/
     ├── lib.rs           # Crate root: module declarations + prelude
-    ├── main.rs          # Headless CLI binary (cargo run)
+    ├── main.rs          # Entry point for the CLI binary (cargo run)
+    ├── cli.rs           # The CLI itself — a module so one cfg makes it
+    │                    # native-only; see the note in main.rs
     ├── bin/
-    │   └── tui.rs       # Full-screen TUI binary (cargo run --bin tui)
+    │   └── tui.rs       # Entry point for the TUI binary (cargo run --bin tui)
+    ├── tui.rs           # The TUI itself, native-only for the same reason
     │                    # EEG + PPG views, device picker, smooth overlay
+    ├── platform.rs      # Spawning and timers per target: tokio natively,
+    │                    # the page's event loop in a browser
     ├── muse_client.rs   # MuseClient (scan/connect) + MuseHandle (commands)
     │                    # Firmware detection + dual protocol dispatch
     │                    # BLE disconnect detection (adapter event stream)

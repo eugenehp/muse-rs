@@ -1,3 +1,26 @@
+# v0.2.1 — 2026-09-27
+
+Dependency-only release: `webbluetooth` 0.0.1 → 0.0.2. Nothing in this crate's
+own API or behaviour changes.
+
+## Fixed
+
+- **Windows targets could not link.** `webbluetooth-windows` 0.0.1 declared
+  `#[link(name = "combase")]`, but the Windows SDK ships no `combase.lib`: the
+  WinRT string and activation exports it wants (`WindowsCreateString`,
+  `RoGetActivationFactory`, and four more) live in `combase.dll` at run time but
+  are imported from `runtimeobject.lib`. Any Windows build that reached this
+  crate died at the final link with `LNK1181: cannot open input file
+  'combase.lib'`. Fixed in `webbluetooth` 0.0.2.
+
+  The requirement had to move here, not only in the consumer. Cargo treats
+  0.0.x releases as mutually incompatible, so a consumer asking for
+  `webbluetooth` 0.0.2 while this crate still asked for 0.0.1 resolved to *two*
+  copies of the crate. That both left the unfixed 0.0.1 Windows backend in the
+  graph — so the link failed anyway — and, because `Bluetooth::shared()`
+  memoises into a `OnceLock`, meant two BLE sessions and devices that would not
+  connect.
+
 # v0.2.0 — 2026-09-21
 
 **If you decode Athena data, read "Fixed" first: this release changes what

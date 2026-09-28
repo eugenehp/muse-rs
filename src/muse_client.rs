@@ -17,6 +17,7 @@ use crate::parse::{
     decode_eeg_samples, parse_accelerometer, parse_athena_notification, parse_gyroscope,
     parse_ppg_reading, parse_telemetry, ControlAccumulator,
 };
+use crate::platform;
 use crate::protocol::{
     decode_response, encode_command, ACCELEROMETER_CHARACTERISTIC, ATHENA_SENSOR_CHARACTERISTIC,
     CONTROL_CHARACTERISTIC, EEG_CHARACTERISTICS, EEG_FREQUENCY, EEG_SAMPLES_PER_READING,
@@ -316,7 +317,7 @@ impl MuseClient {
         // keyed by id, each one is kept once.
         let mut seen: BTreeMap<String, Candidate> = BTreeMap::new();
         let window = Duration::from_secs(self.config.scan_timeout_secs);
-        let _ = tokio::time::timeout(window, async {
+        let _ = platform::timeout(window, async {
             while let Some(candidate) = scan.next().await {
                 if !seen.contains_key(&candidate.id) {
                     info!("scan_all: found {}  id={}", candidate.label(), candidate.id);
@@ -406,13 +407,13 @@ impl MuseClient {
         // to come into range for as long as that takes — so one is imposed
         // here.  Ten seconds is generous for a BLE connection that usually
         // takes under two.
-        tokio::time::timeout(Duration::from_secs(10), gatt.connect())
+        platform::timeout(Duration::from_secs(10), gatt.connect())
             .await
             .map_err(|_| anyhow!("BLE connect() timed out after 10 s"))??;
 
         // Every Muse characteristic lives under the one vendor service, so a
         // single discovery pass produces the whole set.
-        let service = tokio::time::timeout(
+        let service = platform::timeout(
             Duration::from_secs(15),
             gatt.get_primary_service(MUSE_SERVICE_UUID),
         )
@@ -446,7 +447,7 @@ impl MuseClient {
         let disconnect_tx = tx.clone();
         let device_id = device.id().to_owned();
         let mut disconnects = device.watch_disconnect();
-        tokio::spawn(async move {
+        platform::spawn(async move {
             if disconnects.next().await.is_some() {
                 info!("Disconnect watcher: device {device_id} disconnected.");
                 let _ = disconnect_tx.send(MuseEvent::Disconnected).await;
@@ -458,7 +459,7 @@ impl MuseClient {
             streams.push(subscribe_tagged(&chars, ATHENA_SENSOR_CHARACTERISTIC).await?);
             let mut notifications = select_all(streams);
 
-            tokio::spawn(async move {
+            platform::spawn(async move {
                 info!("Athena: notification stream subscribed, waiting for data…");
                 let mut ctrl_acc = ControlAccumulator::new();
                 let mut notif_count: u64 = 0;
@@ -574,7 +575,7 @@ impl MuseClient {
             let enable_aux = self.config.enable_aux;
             let mut notifications = select_all(streams);
 
-            tokio::spawn(async move {
+            platform::spawn(async move {
                 info!("Classic: notification stream subscribed, waiting for data…");
                 let mut notif_count: u64 = 0;
 
@@ -806,7 +807,7 @@ impl MuseHandle {
             // Classic `d` command.  We send both so that streaming starts
             // regardless of firmware version.  The device silently ignores
             // whichever command it does not understand.
-            let delay = |ms| tokio::time::sleep(Duration::from_millis(ms));
+            let delay = |ms| platform::sleep(Duration::from_millis(ms));
             self.send_command("v4").await?;
             delay(100).await;
             self.send_command("s").await?;

@@ -1,3 +1,4 @@
 .DS_Store
 target
 muse-tui.log
+examples/web/dist
