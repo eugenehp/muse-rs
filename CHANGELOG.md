@@ -1,3 +1,16 @@
+# v0.2.2 — 2026-10-15
+
+`webbluetooth` 0.0.3 → 0.0.4. The public API is unchanged.
+
+## Changed
+
+- **`webbluetooth` and `webbluetooth-wasm` 0.0.4.** In 0.0.4 a notification
+  stream ends when its device disconnects; in 0.0.3 it stayed open and silent.
+  So when the link drops, the notification task's `MuseEvent::Disconnected`
+  now arrives reliably, alongside the one from the disconnect watcher. A
+  consumer that stops at the first `Disconnected`, as the TUI does, sees no
+  difference.
+
 # v0.2.1 — 2026-09-28
 
 **The library now runs in a browser.** `webbluetooth` 0.0.1 → 0.0.3, and the

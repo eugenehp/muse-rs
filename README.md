@@ -166,10 +166,10 @@ Use `muse-rs` as a library in your own project:
 # Cargo.toml
 
 # Full build (includes TUI feature):
-muse-rs = "0.2.1"
+muse-rs = "0.2.2"
 
 # Library only — skips ratatui / crossterm compilation:
-muse-rs = { version = "0.2.1", default-features = false }
+muse-rs = { version = "0.2.2", default-features = false }
 ```
 
 ```rust
