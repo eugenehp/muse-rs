@@ -1,7 +1,7 @@
 # muse-rs
 
 A Rust library and terminal UI for streaming real-time sensor data from
-**Interaxon Muse EEG headsets** over Bluetooth Low Energy.
+**Muse EEG headsets** over Bluetooth Low Energy.
 
 Supports every Muse model — including the newer Muse S running the **Athena**
 firmware — and automatically selects the correct protocol at connection time.
@@ -45,7 +45,7 @@ Athena EEG supports both 4-channel (tag `0x11`, 4 samples/pkt) and 8-channel
 
 ## Firmware variants: Classic vs. Athena
 
-Interaxon ships two completely different BLE protocols depending on the device
+They ship two completely different BLE protocols depending on the device
 and firmware version.  This library detects which one is in use at connect time
 and switches behaviour automatically — no configuration is required.
 
@@ -681,7 +681,7 @@ stream, handling nested objects and fragments that split mid-token.
 * [muse-jsx](https://github.com/eugenehp/muse-jsx) — TypeScript reference implementation (Web Bluetooth); basis for the Athena startup sequence and `parsePacket()` tag decoder
 * [webbluetooth](https://github.com/eugenehp/webbluetooth) — The Web Bluetooth API for Rust; the BLE layer this client is built on
 * [urish/muse-js](https://github.com/urish/muse-js) — Original muse-js library by Uri Shaked
-* [Interaxon Muse](https://choosemuse.com/) — Official Muse headset manufacturer
+* [Muse](https://choosemuse.com/) — Official Muse headset manufacturer
 
 ---
 
@@ -699,7 +699,7 @@ If you use `muse-rs` in academic research or published work, please cite it as:
   url          = {https://github.com/eugenehp/muse-rs},
   version      = {0.2.0},
   description  = {Async Rust library and terminal UI for streaming real-time
-                  EEG, PPG, IMU, and battery data from Interaxon Muse headsets
+                  EEG, PPG, IMU, and battery data from Muse headsets
                   over Bluetooth Low Energy. Supports Classic and Athena
                   firmware with automatic protocol detection.},
 }

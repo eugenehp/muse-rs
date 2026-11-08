@@ -12,10 +12,12 @@
 /// Channels 4–7 (FPz, AUX\_R, AUX\_L, AUX) are only produced by Athena hardware.
 #[derive(Debug, Clone)]
 pub struct EegReading {
-    /// Sequential packet index emitted by the headset (wraps at 0xFFFF).
+    /// Sequential packet index emitted by the headset.
     ///
-    /// Used to reconstruct timestamps for Classic firmware.
-    /// Always `0` for Athena (Athena notifications do not carry a per-channel index).
+    /// **Classic:** 16-bit, per electrode; used to reconstruct timestamps.
+    /// **Athena:** the EEG subpacket counter, 8-bit (wraps at 255) and shared
+    /// by every electrode in the subpacket. A skip is reported as a
+    /// [`MuseEvent::Gap`].
     pub index: u16,
     /// Electrode channel index.
     ///
@@ -54,7 +56,8 @@ pub struct EegReading {
 /// 24-bit samples at 64 Hz.
 #[derive(Debug, Clone)]
 pub struct PpgReading {
-    /// Sequential packet index (wraps at 0xFFFF), same purpose as [`EegReading::index`].
+    /// Sequential packet index, as for [`EegReading::index`]: 16-bit on
+    /// Classic, the 8-bit optical subpacket counter on Athena.
     pub index: u16,
     /// Optical channel.
     ///
@@ -82,14 +85,14 @@ pub struct PpgReading {
 ///
 /// | Field | Classic | Athena |
 /// |---|---|---|
-/// | `sequence_id` | from packet | always `0` |
-/// | `battery_level` | u16 BE ÷ 512 | u16 LE ÷ 512 |
+/// | `sequence_id` | from packet | battery subpacket counter (8-bit) |
+/// | `battery_level` | u16 BE ÷ 512 | u16 LE ÷ 256 |
 /// | `fuel_gauge_voltage` | u16 BE × 2.2 mV | always `0.0` |
 /// | `temperature` | u16 BE raw ADC | always `0` |
 #[derive(Debug, Clone)]
 pub struct TelemetryData {
-    /// Monotonically increasing packet counter (wraps at 0xFFFF).
-    /// Always `0` for Athena notifications.
+    /// Monotonically increasing packet counter: 16-bit on Classic, the 8-bit
+    /// battery subpacket counter on Athena.
     pub sequence_id: u16,
     /// Battery state-of-charge in percent (0–100).
     /// Derived from the raw fuel-gauge reading divided by 512.
@@ -116,9 +119,7 @@ pub struct XyzSample {
 /// A batch of inertial measurements from one BLE notification.
 ///
 /// Both the accelerometer and gyroscope fire at ≈ 52 Hz and carry 3 XYZ
-/// samples per notification on Classic firmware.  Athena packs 3 samples
-/// as well but only the first is currently forwarded (indices 1 and 2 are
-/// copies of index 0 in the Athena decoder).
+/// samples per notification, on both firmwares.
 ///
 /// # Wire format differences
 ///
@@ -127,15 +128,65 @@ pub struct XyzSample {
 /// | Integer type | `i16` big-endian | `i16` little-endian |
 /// | Accel scale | +0.0000610352 g/LSB | +0.0000610352 g/LSB |
 /// | Gyro scale | +0.0074768 °/s/LSB | −0.0074768 °/s/LSB (negated) |
-/// | `sequence_id` | from packet | always `0` |
+/// | `sequence_id` | from packet | IMU subpacket counter (8-bit) |
 #[derive(Debug, Clone)]
 pub struct ImuData {
-    /// Monotonically increasing packet counter (wraps at 0xFFFF).
-    /// Always `0` for Athena notifications.
+    /// Monotonically increasing packet counter: 16-bit on Classic, the 8-bit
+    /// IMU subpacket counter on Athena.
     pub sequence_id: u16,
     /// Three consecutive XYZ samples; index 0 is the oldest.
-    /// For Athena, indices 1 and 2 are currently copies of index 0.
     pub samples: [XyzSample; 3],
+}
+
+/// One Athena DRL/REF packet (tag `0x53`): the driven-right-leg and reference
+/// electrode levels.
+///
+/// The layout — two channels, six samples each, as twelve little-endian `u16`
+/// interleaved per sample — is the one it `DRL_REF` packet maker
+/// declares, and it is confirmed by the shape of real data from a Muse S
+/// Athena (fw 3.1.19): de-interleaved this way each channel holds a steady
+/// level of its own (≈ 8232 and ≈ 8272) with a spread of one or two counts.
+/// Any other reading smears the two together.
+///
+/// Values are raw. Which of the pair is DRL and which REF, and the conversion
+/// to volts, are not documented anywhere this crate can cite, so neither is
+/// guessed at.
+#[derive(Debug, Clone)]
+pub struct DrlRefData {
+    /// The subpacket's sequence counter (0–255, wraps). See [`DataGap`].
+    pub index: u16,
+    /// Six samples, oldest first, each holding both channels.
+    pub samples: Vec<[u16; 2]>,
+}
+
+/// Which stream a [`DataGap`] was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sensor {
+    Eeg,
+    Optical,
+    Imu,
+    DrlRef,
+    Battery,
+}
+
+/// Data the headset counted out but that never arrived.
+///
+/// Athena numbers each sensor's subpackets with its own 8-bit counter, so a
+/// counter that skips is data lost — and it is lost on the headset side: on a
+/// Muse S Athena (fw 3.1.19) the EEG counter skipped roughly once every 140
+/// subpackets while the counter of the packets carrying them never did. A
+/// consumer that lays samples on a time axis by counting them needs this to
+/// keep the axis honest; it fills the hole with NaN samples.
+///
+/// Only Athena produces these. A run of 256 or more lost subpackets wraps the
+/// counter and cannot be seen.
+#[derive(Debug, Clone)]
+pub struct DataGap {
+    pub sensor: Sensor,
+    /// Subpackets missing between the previous one and this one.
+    pub missing_packets: u32,
+    /// The same gap in samples per channel, at the rate of the stream it is in.
+    pub missing_samples: u32,
 }
 
 /// A time-aligned multi-channel EEG snapshot.
@@ -168,6 +219,16 @@ pub struct ControlResponse {
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
+impl ControlResponse {
+    /// The return code, when this is a reply to a command.
+    ///
+    /// Every command the headset accepts is answered with an object carrying
+    /// `rc` — `0` for success — alone or alongside the data asked for.
+    pub fn rc(&self) -> Option<i64> {
+        self.fields.get("rc").and_then(|v| v.as_i64())
+    }
+}
+
 /// All data events emitted by [`crate::muse_client::MuseClient`].
 ///
 /// Consumers receive these values through the `mpsc::Receiver` returned by
@@ -180,12 +241,18 @@ pub struct ControlResponse {
 /// |---|---|---|
 /// | `Eeg` (ch 0–3) | ✓ | ✓ |
 /// | `Eeg` (ch 4–7) | ✗ | ✓ |
-/// | `Ppg` | ✓ (opt-in) | ✗ |
+/// | `Ppg` | ✓ (opt-in) | ✓ |
 /// | `Accelerometer` | ✓ | ✓ |
 /// | `Gyroscope` | ✓ | ✓ |
 /// | `Telemetry` | ✓ | ✓ |
 /// | `Control` | ✓ | ✓ |
+/// | `DrlRef` | ✗ | ✓ |
+/// | `Gap` | ✗ | ✓ |
+///
+/// Non-exhaustive: the headsets carry more than is decoded yet, and each new
+/// stream would otherwise be a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum MuseEvent {
     /// An EEG packet from one electrode channel.
     ///
@@ -195,9 +262,9 @@ pub enum MuseEvent {
     Eeg(EegReading),
     /// A PPG (photoplethysmography) optical packet.
     ///
-    /// Requires `enable_ppg: true` in [`crate::muse_client::MuseClientConfig`]
-    /// on both firmwares — on Athena that selects a preset carrying optical
-    /// channels (`p1044`) over one that does not (`p1041`).
+    /// Classic sends these only with `enable_ppg: true`. Athena always
+    /// does: every Athena preset carries optical data, and `enable_ppg` picks
+    /// how many channels — see [`crate::muse_client::MuseHandle::start`].
     Ppg(PpgReading),
     /// Battery and housekeeping telemetry (~1 Hz).
     ///
@@ -214,6 +281,10 @@ pub enum MuseEvent {
     /// Produced by both Classic and Athena.  Athena gyro values are negated
     /// relative to Classic (−0.0074768 vs +0.0074768 °/s/LSB).
     Gyroscope(ImuData),
+    /// DRL/REF electrode levels (Athena; 32 Hz, six samples per packet).
+    DrlRef(DrlRefData),
+    /// Subpackets the headset counted out but that never arrived (Athena).
+    Gap(DataGap),
     /// A complete JSON control/status response from the headset.
     ///
     /// Produced by both Classic and Athena in response to commands such as

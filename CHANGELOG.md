@@ -1,3 +1,51 @@
+# Unreleased
+
+## Fixed
+
+- **Notifications holding more than one packet.** Each Athena packet opens
+  with its own length, and a notification can carry several back to back. The
+  parser read on past the first packet's end and took the next one's header
+  for subpackets: any header byte equal to a sensor tag produced a reading made
+  of header bytes — eight channels of EEG, typically — and the second packet's
+  real data was lost. Packets are now split on their length, as
+  OpenMuse does. macOS has been seen delivering one packet per notification, so
+  the bug may not have shown there.
+- **Unknown tags no longer trigger a byte-by-byte scan.** Searching forward for
+  something that looks like a tag finds payload bytes as often as tags; an
+  unknown tag now ends its packet.
+
+## Added
+
+- **`MuseEvent::Gap`** — data the headset counted out but never delivered.
+  Every Athena sensor numbers its subpackets with its own 8-bit counter, and
+  on real hardware the EEG counter skips about once every 140 subpackets,
+  optical a little more often, while the packets carrying them never do — the
+  loss is on the headset. Each gap reports its sensor and size in packets and
+  in samples per channel. `parse::AthenaDecoder` is the stateful decoder that
+  finds them; `parse_athena_notification` stays stateless.
+- **`MuseEvent::DrlRef`** — the DRL/REF electrode levels (tag `0x53`), which
+  were skipped. Two channels × six samples of `u16` LE, the layout
+  declares and real data confirms; raw values, since the units are not known.
+- **Athena counters in `index` / `sequence_id`.** Previously always `0`.
+- **`MuseHandle::command`** — sends a command and waits for the headset's
+  reply. Every command is answered with JSON carrying `rc`, now readable as
+  `ControlResponse::rc()`. Commands are taken one at a time, as does.
+- **`MAX_COMMAND_LEN`** — `send_command` refuses commands longer than the
+  18 bytes a single control write carries, rather than send a frame the
+  headset truncates.
+- The CLI shows lost samples in the streaming summary and in `info`, and
+  prints `[GAP]` and `[DRL/REF]` lines with `--raw`.
+
+## Changed
+
+- **`start`, `pause` and `resume` wait for each command's reply** instead of
+  firing on fixed delays, and log refusals. On Athena, `dc001` is sent once and
+  the Classic `d` only if `dc001` is refused, rather than both always — fw
+  3.1.19 accepts `dc001` and refuses `d` with `rc:255`. `L1` is the one
+  command the headset never answers, so it is still sent without waiting.
+- `MuseEvent` is `#[non_exhaustive]`, so the next stream decoded is not another
+  breaking change.
+
 # v0.2.2 — 2026-10-15
 
 `webbluetooth` 0.0.3 → 0.0.4. The public API is unchanged.
@@ -182,7 +230,7 @@ step.
 
 # v0.1.0
 
-First feature-complete release of `muse-rs` — an async Rust library and terminal UI for streaming real-time sensor data from Interaxon Muse EEG headsets over Bluetooth Low Energy.
+First feature-complete release of `muse-rs` — an async Rust library and terminal UI for streaming real-time sensor data from Muse EEG headsets over Bluetooth Low Energy.
 
 ## Highlights
 

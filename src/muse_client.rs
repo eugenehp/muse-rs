@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, Mutex};
 use uuid::Uuid;
 use webbluetooth::chooser::{Candidate, FirstMatch};
 use webbluetooth::stream::{select_all, BoxStream, StreamExt};
@@ -14,8 +14,8 @@ use webbluetooth::{
 };
 
 use crate::parse::{
-    decode_eeg_samples, parse_accelerometer, parse_athena_notification, parse_gyroscope,
-    parse_ppg_reading, parse_telemetry, ControlAccumulator,
+    decode_eeg_samples, parse_accelerometer, parse_gyroscope, parse_ppg_reading, parse_telemetry,
+    AthenaDecoder, ControlAccumulator,
 };
 use crate::platform;
 use crate::protocol::{
@@ -84,6 +84,41 @@ async fn subscribe_tagged(
     let characteristic = find_char(chars, uuid)?;
     let notifications = characteristic.start_notifications().await?;
     Ok(notifications.map(move |value| (uuid, value)).boxed())
+}
+
+/// Feed one control-characteristic notification to the accumulator, and
+/// deliver any JSON object it completes: to the event channel, and to whoever
+/// is waiting on a command's reply.
+async fn handle_control(
+    data: &[u8],
+    acc: &mut ControlAccumulator,
+    tx: &mpsc::Sender<MuseEvent>,
+    replies: &broadcast::Sender<ControlResponse>,
+) {
+    let fragment = decode_response(data);
+    debug!("Control fragment: {:?}", fragment);
+    let Some(json_str) = acc.push(&fragment) else {
+        return;
+    };
+    match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(serde_json::Value::Object(fields)) => {
+            let response = ControlResponse {
+                raw: json_str,
+                fields,
+            };
+            // No receiver is the normal case — nobody is waiting on a reply.
+            let _ = replies.send(response.clone());
+            let _ = tx.send(MuseEvent::Control(response)).await;
+        }
+        Ok(_) => {}
+        Err(e) => warn!("Control JSON parse error: {e} | raw: {json_str}"),
+    }
+}
+
+/// Lowercase hex with no separators, for trace logs that are meant to be
+/// parsed back into bytes.
+fn hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Timestamp helper ──────────────────────────────────────────────────────────
@@ -233,10 +268,12 @@ pub struct MuseClientConfig {
     /// **Classic** — changes the startup preset to `p50`, giving three
     /// channels.
     ///
-    /// **Athena** — selects preset `p1044` (eight optical channels) over
-    /// `p1041` (none). Athena optical data *is* decoded into
+    /// **Athena** — no effect: the preset comes from the `enable_ppg`
+    /// argument of [`MuseHandle::start`] (`p1041`, sixteen optical channels,
+    /// when true; `p1045`, four, when false — Athena always streams some
+    /// optical). Its optical data is decoded into
     /// [`crate::types::MuseEvent::Ppg`]; every channel the mode carries is
-    /// reported, which is four, eight or sixteen depending on the preset.
+    /// reported.
     ///
     /// Default: `false`.
     pub enable_ppg: bool,
@@ -439,6 +476,9 @@ impl MuseClient {
 
         // ── Event channel ─────────────────────────────────────────────────────
         let (tx, rx) = mpsc::channel::<MuseEvent>(256);
+        // Replies to commands, for `MuseHandle::command`. Small: a reply is
+        // either taken at once by the command waiting on it, or by no one.
+        let (replies, _) = broadcast::channel::<ControlResponse>(16);
         let _ = tx.send(MuseEvent::Connected(device_name.clone())).await;
 
         // ── Disconnect watcher ──────────────────────────────────────────────
@@ -459,88 +499,36 @@ impl MuseClient {
             streams.push(subscribe_tagged(&chars, ATHENA_SENSOR_CHARACTERISTIC).await?);
             let mut notifications = select_all(streams);
 
+            let replies = replies.clone();
             platform::spawn(async move {
                 info!("Athena: notification stream subscribed, waiting for data…");
                 let mut ctrl_acc = ControlAccumulator::new();
-                let mut notif_count: u64 = 0;
+                let mut decoder = AthenaDecoder::new();
                 let mut sensor_count: u64 = 0;
-                let mut eeg_event_count: u64 = 0;
 
                 while let Some((uuid, data)) = notifications.next().await {
                     let data = &data[..];
-                    notif_count += 1;
 
                     if uuid == CONTROL_CHARACTERISTIC {
-                        let fragment = decode_response(data);
-                        debug!("Athena control fragment: {:?}", fragment);
-                        if let Some(json_str) = ctrl_acc.push(&fragment) {
-                            match serde_json::from_str::<serde_json::Value>(&json_str) {
-                                Ok(serde_json::Value::Object(map)) => {
-                                    let _ = tx
-                                        .send(MuseEvent::Control(ControlResponse {
-                                            raw: json_str,
-                                            fields: map,
-                                        }))
-                                        .await;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    warn!("Athena control JSON error: {e} | raw: {json_str}")
-                                }
-                            }
-                        }
+                        handle_control(data, &mut ctrl_acc, &tx, &replies).await;
                         continue;
                     }
 
                     // All sensor data arrives on ATHENA_SENSOR_CHARACTERISTIC
                     sensor_count += 1;
-                    let events = parse_athena_notification(data);
-                    let n_eeg = events
-                        .iter()
-                        .filter(|e| matches!(e, MuseEvent::Eeg(_)))
-                        .count();
-                    eeg_event_count += n_eeg as u64;
-
+                    log::trace!("Athena raw: {}", hex(data));
+                    let events = decoder.decode(data);
                     if sensor_count <= 3 || sensor_count.is_multiple_of(500) {
                         info!(
-                            "Athena sensor: notif #{notif_count} sensor #{sensor_count} \
-                             uuid={} len={} events={} eeg={} (total eeg: {eeg_event_count})",
-                            uuid,
+                            "Athena sensor: notification #{sensor_count} len={} events={}",
                             data.len(),
                             events.len(),
-                            n_eeg,
                         );
-                        if sensor_count <= 3 && !data.is_empty() {
-                            // Dump ALL tags found in the packet for debugging.
-                            let pkt_len = data[0] as usize;
-                            let mut tags = Vec::new();
-                            let mut ti = 9usize; // skip 9-byte header
-                            while ti < data.len() {
-                                let t = data[ti];
-                                tags.push(format!("0x{t:02x}@{ti}"));
-                                let payload_start = ti + 1 + 4;
-                                if let Some(plen) = crate::parse::athena_payload_len(t) {
-                                    if payload_start + plen <= data.len() {
-                                        ti = payload_start + plen;
-                                    } else {
-                                        break; // truncated
-                                    }
-                                } else if t == 0x88 {
-                                    // Variable-length battery: skip to end.
-                                    ti = pkt_len.min(data.len());
-                                } else {
-                                    ti += 1; // unknown
-                                }
-                            }
-                            debug!("Athena sensor tags: [{}]", tags.join(", "));
-                            debug!(
-                                "Athena sensor raw (first 64 bytes): {:02x?}",
-                                &data[..data.len().min(64)]
-                            );
-                        }
                     }
-
                     for event in events {
+                        if let MuseEvent::Gap(gap) = &event {
+                            debug!("Athena: {gap:?}");
+                        }
                         let _ = tx.send(event).await;
                     }
                 }
@@ -574,6 +562,7 @@ impl MuseClient {
             let enable_ppg = self.config.enable_ppg;
             let enable_aux = self.config.enable_aux;
             let mut notifications = select_all(streams);
+            let replies = replies.clone();
 
             platform::spawn(async move {
                 info!("Classic: notification stream subscribed, waiting for data…");
@@ -596,24 +585,7 @@ impl MuseClient {
                     }
 
                     if uuid == CONTROL_CHARACTERISTIC {
-                        let fragment = decode_response(data);
-                        debug!("Control fragment: {:?}", fragment);
-                        if let Some(json_str) = ctrl_acc.push(&fragment) {
-                            match serde_json::from_str::<serde_json::Value>(&json_str) {
-                                Ok(serde_json::Value::Object(map)) => {
-                                    let _ = tx
-                                        .send(MuseEvent::Control(ControlResponse {
-                                            raw: json_str,
-                                            fields: map,
-                                        }))
-                                        .await;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    warn!("Control JSON parse error: {e} | raw: {json_str}")
-                                }
-                            }
-                        }
+                        handle_control(data, &mut ctrl_acc, &tx, &replies).await;
                         continue;
                     }
 
@@ -702,6 +674,8 @@ impl MuseClient {
             gatt,
             control_char,
             is_athena,
+            replies,
+            command_lock: Mutex::new(()),
         };
 
         Ok((rx, handle))
@@ -716,11 +690,37 @@ pub struct MuseHandle {
     control_char: RemoteGattCharacteristic,
     /// `true` when the connected device runs the Athena firmware (new Muse S).
     pub is_athena: bool,
+    /// Every complete control-channel JSON object, as the dispatch task
+    /// assembles it.
+    replies: broadcast::Sender<ControlResponse>,
+    /// Held across a command and its reply. A reply names no command, so with
+    /// two in flight there is no telling whose is whose.
+    command_lock: Mutex<()>,
 }
 
+/// How long [`MuseHandle::command`] waits for a reply.
+///
+/// Replies normally arrive within one or two connection intervals — tens of
+/// milliseconds — so this only bounds a command the headset ignores.
+const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The longest command the control characteristic takes.
+///
+/// A write is one 20-byte frame: a length byte, the command, and `\n`. It
+/// refuses anything longer (`Detected payload larger than 19 bytes`) rather
+/// than split it, and so does this.
+pub const MAX_COMMAND_LEN: usize = 18;
+
 impl MuseHandle {
-    /// Send a raw command string (e.g. `"h"`, `"d"`, `"p21"`).
+    /// Send a raw command string (e.g. `"h"`, `"d"`, `"p21"`) without waiting
+    /// for the reply. See [`MuseHandle::command`] for the version that does.
     pub async fn send_command(&self, cmd: &str) -> Result<()> {
+        if cmd.len() > MAX_COMMAND_LEN {
+            return Err(anyhow!(
+                "command {cmd:?} is {} bytes; the headset takes at most {MAX_COMMAND_LEN}",
+                cmd.len()
+            ));
+        }
         let payload = encode_command(cmd);
         self.control_char
             .write_value_without_response(&payload)
@@ -728,26 +728,87 @@ impl MuseHandle {
         Ok(())
     }
 
+    /// Send a command and wait for the headset's reply.
+    ///
+    /// The headset answers every command it accepts with a JSON object
+    /// carrying `rc` — `{"rc":0}` alone, or alongside the data asked for, as
+    /// `v4` and `s` do — and [`ControlResponse::rc`] is the result. The reply
+    /// also arrives as a [`MuseEvent::Control`] as usual.
+    ///
+    /// Commands are taken one at a time: a reply names no command, so this
+    /// holds the next one back until the current one is answered, as it
+    /// does. A reply still owed to an earlier [`MuseHandle::send_command`] can
+    /// be taken for this command's; don't mix the two in flight.
+    ///
+    /// Errors if the write fails or no reply comes within two seconds.
+    pub async fn command(&self, cmd: &str) -> Result<ControlResponse> {
+        let _turn = self.command_lock.lock().await;
+        // Subscribed before writing, so a fast reply cannot be missed.
+        let mut replies = self.replies.subscribe();
+        self.send_command(cmd).await?;
+        platform::timeout(COMMAND_REPLY_TIMEOUT, async {
+            loop {
+                match replies.recv().await {
+                    Ok(reply) if reply.rc().is_some() => return Ok(reply),
+                    // Unsolicited JSON, not a reply.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow!("connection closed waiting for reply to {cmd:?}"))
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "no reply to {cmd:?} within {} s",
+                COMMAND_REPLY_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    /// One step of a startup sequence: send `cmd`, wait for its reply, and
+    /// return its `rc`.
+    ///
+    /// A missing or non-zero reply is logged rather than fatal, because the
+    /// sequences below are built to tolerate a command the firmware does not
+    /// know. A failed write is fatal: the link is gone.
+    async fn step(&self, cmd: &str) -> Result<Option<i64>> {
+        match self.command(cmd).await {
+            Ok(reply) => {
+                let rc = reply.rc();
+                if rc == Some(0) {
+                    debug!("{cmd}: ok");
+                } else {
+                    warn!("{cmd}: rejected, {}", reply.raw);
+                }
+                Ok(rc)
+            }
+            Err(e) if self.gatt.connected() => {
+                warn!("{cmd}: {e}");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Pause data streaming.
     ///
     /// Sends `h` to both Classic and Athena firmware.
     pub async fn pause(&self) -> Result<()> {
-        self.send_command("h").await
+        self.step("h").await.map(drop)
     }
 
     /// Resume data streaming after a pause.
     ///
-    /// Sends both `dc001` (Athena) and `d` (Classic) when connected to an
-    /// Athena device, because some Athena firmware versions (e.g. 3.x) only
-    /// accept the Classic `d` command.  On Classic devices only `d` is sent.
+    /// On Athena, `dc001` first, and the Classic `d` only if that is refused —
+    /// some Athena firmware answers `dc001` with `rc:69` and takes `d`
+    /// instead. On Classic devices only `d` is sent.
     pub async fn resume(&self) -> Result<()> {
-        if self.is_athena {
-            // Try both: dc001 for newer Athena fw, d for older/transitional.
-            self.send_command("dc001").await?;
-            self.send_command("d").await
-        } else {
-            self.send_command("d").await
+        if self.is_athena && self.step("dc001").await? == Some(0) {
+            return Ok(());
         }
+        self.step("d").await.map(drop)
     }
 
     /// Initialise the headset and begin streaming sensor data.
@@ -764,7 +825,16 @@ impl MuseHandle {
     ///
     /// # Athena startup sequence
     ///
-    /// `v4` → `s` → `h` → *preset* → `dc001` × 2 → `L1` → **2 s wait**
+    /// `v4` → `s` → `h` → *preset* → `dc001` (→ `d` if refused) → `L1` →
+    /// **2 s wait**
+    ///
+    /// Each command but `L1`, which the headset never answers, waits for its
+    /// reply before the next is sent — see [`MuseHandle::command`]. A refused
+    /// or unanswered command is logged and the sequence carries on.
+    ///
+    /// Measured on a Muse S Athena (fw 3.1.19): replies in 30–100 ms, `dc001`
+    /// accepted, and data flowing 0.4 s after connecting. `d` is refused with
+    /// `rc:255` there, which is why it is only a fallback.
     ///
     /// | `enable_ppg` | Preset | Streams |
     /// |---|---|---|
@@ -780,16 +850,30 @@ impl MuseHandle {
     /// EEG to four channels.
     ///
     /// The whole table is measurement, not documentation — every preset
-    /// switched on a Muse S Athena (fw 3.1.11), counting what arrived:
+    /// it names, switched on a Muse S Athena (fw 3.1.11, and again on
+    /// 3.1.19), counting the tags that arrived:
     ///
-    /// | preset | EEG | optical |
-    /// |---|---|---|
-    /// | `p1041`, `p1042` | 8ch | 16ch (`0x36`) |
-    /// | `p1043`, `p1044` | 8ch | 8ch (`0x35`) |
-    /// | `p1045`, `p1046` | 8ch | 4ch (`0x34`) |
-    /// | `p1034` | 4ch | 8ch (`0x35`) |
-    /// | `p1035` | 4ch | 4ch (`0x34`) |
-    /// | `p21` | 4ch | none |
+    /// | preset | EEG | optical | IMU | DRL/REF |
+    /// |---|---|---|---|---|
+    /// | `p1025`, `p1026`, `p1041`, `p1042` | 8ch | 16ch (`0x36`) | ✓ | ✓ |
+    /// | `p1027`, `p1028`, `p1043`, `p1044` | 8ch | 8ch (`0x35`) | ✓ | ✓ |
+    /// | `p1029`, `p102A`, `p1045`, `p1046` | 8ch | 4ch (`0x34`) | ✓ | ✓ |
+    /// | `p1031`, `p1032` | 4ch | 16ch (`0x36`) | ✓ | ✓ |
+    /// | `p1033`, `p1034` | 4ch | 8ch (`0x35`) | ✓ | ✓ |
+    /// | `p1035`, `p1036` | 4ch | 4ch (`0x34`) | ✓ | ✓ |
+    /// | `p1022` | 8ch | none | none | ✓ |
+    /// | `p1023` | a trickle | none | none | none |
+    /// | `p1024` | none | none | ✓ | none |
+    /// | `p21` | 4ch | none | ✓ | ✓ |
+    ///
+    /// `p1021` is the preset the headset powers up in (`"ps":4129` in the
+    /// status reply — the field is the preset in hex). What separates the
+    /// pairs sharing a row is not visible in which tags arrive.
+    ///
+    /// Not this headset's: `p408C`, `p407C` and the Classic presets other than
+    /// `p21` (`p10`–`p55` tried) get no reply at all, and the previous preset
+    /// carries on — which is why [`MuseHandle::command`] reports a timeout
+    /// rather than a refusal for them.
     ///
     /// Per-channel rate is the same across optical modes — 16 channels carry
     /// one sample per packet where 8 carry two — so the wider mode is more
@@ -800,38 +884,26 @@ impl MuseHandle {
     /// packets actually start flowing.
     pub async fn start(&self, enable_ppg: bool, enable_aux: bool) -> Result<()> {
         if self.is_athena {
-            // Athena startup — mirrors MuseAthenaClient.start() in muse-jsx.
-            //
-            // Some Athena firmware versions (e.g. Muse S fw 3.x on
-            // Athena_RevE hardware) reject `dc001` (rc:69) but accept the
-            // Classic `d` command.  We send both so that streaming starts
-            // regardless of firmware version.  The device silently ignores
-            // whichever command it does not understand.
-            let delay = |ms| platform::sleep(Duration::from_millis(ms));
-            self.send_command("v4").await?;
-            delay(100).await;
-            self.send_command("s").await?;
-            delay(100).await;
-            self.send_command("h").await?;
-            delay(100).await;
+            // Athena startup — the order of MuseAthenaClient.start() in
+            // muse-jsx, with each command answered before the next is sent,
+            // as it does.
+            self.step("v4").await?;
+            self.step("s").await?;
+            self.step("h").await?;
             // The richest mode the device offers, rather than a fixed preset:
             // `p1041` carries sixteen optical channels where `p1045` carries
             // four, at the same per-channel rate.
             let preset = if enable_ppg { "p1041" } else { "p1045" };
-            self.send_command(preset).await?;
-            delay(100).await;
-            // Athena data-start: send dc001 twice (per TypeScript reference),
-            // then also send Classic `d` as fallback for fw 3.x which rejects
-            // dc001 with rc:69.
-            self.send_command("dc001").await?;
-            delay(50).await;
-            self.send_command("dc001").await?;
-            delay(50).await;
-            self.send_command("d").await?;
-            delay(100).await;
+            self.step(preset).await?;
+            // `dc001` starts data on Athena; some firmware (e.g. Muse S fw 3.x
+            // on Athena_RevE) refuses it with rc:69 and takes the Classic `d`.
+            // `resume` sends `d` only when `dc001` was refused.
+            self.resume().await?;
+            // The one command that goes unanswered (fw 3.1.19), so it is not
+            // waited on.
             self.send_command("L1").await?;
             // Firmware needs ~2 s to settle before packets arrive.
-            delay(2100).await;
+            platform::sleep(Duration::from_millis(2100)).await;
             Ok(())
         } else {
             // Classic startup
@@ -843,8 +915,8 @@ impl MuseHandle {
             } else {
                 "p21"
             };
-            self.send_command("s").await?;
-            self.send_command(preset).await?;
+            self.step("s").await?;
+            self.step(preset).await?;
             self.resume().await?;
             Ok(())
         }

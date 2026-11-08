@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use muse_rs::muse_client::{MuseClient, MuseClientConfig, MuseDevice, MuseHandle};
 use muse_rs::protocol::{eeg_channel_name, ppg_channel_name};
-use muse_rs::types::MuseEvent;
+use muse_rs::types::{MuseEvent, Sensor};
 use tokio::sync::mpsc::Receiver;
 
 // ── Arguments ─────────────────────────────────────────────────────────────────
@@ -174,6 +174,9 @@ struct Seen {
     gyro: u64,
     telemetry: u64,
     battery: Option<f64>,
+    /// Samples per channel the headset counted out but never delivered, by
+    /// stream.
+    lost: BTreeMap<&'static str, u64>,
     firmware: Option<serde_json::Map<String, serde_json::Value>>,
     is_athena: bool,
     name: Option<String>,
@@ -209,6 +212,9 @@ impl Seen {
             MuseEvent::Telemetry(t) => {
                 self.telemetry += 1;
                 self.battery = Some(t.battery_level as f64);
+            }
+            MuseEvent::Gap(g) => {
+                *self.lost.entry(sensor_name(g.sensor)).or_default() += g.missing_samples as u64;
             }
             MuseEvent::Control(c) => {
                 if c.fields.contains_key("fw") {
@@ -283,6 +289,12 @@ impl Seen {
             self.gyro as f64 / elapsed
         );
         println!("    telemetry   {:.1} Hz", self.telemetry as f64 / elapsed);
+        if !self.lost.is_empty() {
+            println!(
+                "    lost        {} (samples per channel, dropped by the headset)",
+                self.lost_list()
+            );
+        }
 
         if !self.eeg.is_empty() {
             let contact: String = self
@@ -315,8 +327,18 @@ impl Seen {
             accel: self.accel,
             gyro: self.gyro,
             telemetry: self.telemetry,
+            lost: self.lost.clone(),
             ..Default::default()
         }
+    }
+
+    /// `EEG 12, optical 3` — the lost-sample counts, for display.
+    fn lost_list(&self) -> String {
+        self.lost
+            .iter()
+            .map(|(name, n)| format!("{name} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Samples per channel since `previous`, which is what a rate should be
@@ -359,9 +381,24 @@ impl Seen {
         } else {
             format!("  ⚠ railing: {}", railing.join(" "))
         };
+        // Data the headset dropped this interval. Rates alone hide it: a
+        // stream that lost 2% still rounds to its nominal rate.
+        let lost: Vec<String> = self
+            .lost
+            .iter()
+            .filter_map(|(name, n)| {
+                let new = n - previous.lost.get(name).copied().unwrap_or(0);
+                (new > 0).then(|| format!("{name} {new}"))
+            })
+            .collect();
+        let lost = if lost.is_empty() {
+            String::new()
+        } else {
+            format!("  lost: {}", lost.join(", "))
+        };
 
         format!(
-            "t={:>4.0}s  eeg {:>2}ch {:>9}  opt {:>2}ch {:>9}  imu {:>3.0}Hz  batt {:>4}  │ {electrodes} µV{contact}",
+            "t={:>4.0}s  eeg {:>2}ch {:>9}  opt {:>2}ch {:>9}  imu {:>3.0}Hz  batt {:>4}  │ {electrodes} µV{contact}{lost}",
             elapsed,
             self.eeg.len(),
             Self::rate(Self::delta(&self.eeg, &previous.eeg, |e| e.samples), interval),
@@ -423,7 +460,13 @@ async fn start(handle: &MuseHandle, args: &Args) -> Result<()> {
     if let Some(preset) = &args.preset {
         println!("switching to preset {preset}");
         handle.pause().await?;
-        handle.send_command(preset).await?;
+        // A preset the headset does not have is refused, and the previous one
+        // carries on — so a refusal has to be said, or the stream that
+        // follows is mistaken for the one asked for.
+        let reply = handle.command(preset).await?;
+        if reply.rc() != Some(0) {
+            println!("  ⚠ preset {preset} refused: {}", reply.raw);
+        }
         handle.resume().await?;
         // The firmware needs a moment before packets resume.
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -686,6 +729,16 @@ fn print_raw(event: &MuseEvent, is_athena: bool) {
                 g.sequence_id, s.x, s.y, s.z
             );
         }
+        MuseEvent::DrlRef(d) => {
+            let s = d.samples.first().copied().unwrap_or_default();
+            println!("[DRL/REF] idx={:5} sample[0]={} {}", d.index, s[0], s[1]);
+        }
+        MuseEvent::Gap(g) => println!(
+            "[GAP] {} missing {} packet(s), {} sample(s) per channel",
+            sensor_name(g.sensor),
+            g.missing_packets,
+            g.missing_samples
+        ),
         MuseEvent::Control(c) => {
             let kind = if c.fields.contains_key("fw") {
                 "DEVICE INFO"
@@ -694,6 +747,17 @@ fn print_raw(event: &MuseEvent, is_athena: bool) {
             };
             println!("[{kind}] {}", c.raw);
         }
+        _ => {}
+    }
+}
+
+fn sensor_name(sensor: Sensor) -> &'static str {
+    match sensor {
+        Sensor::Eeg => "EEG",
+        Sensor::Optical => "optical",
+        Sensor::Imu => "IMU",
+        Sensor::DrlRef => "DRL/REF",
+        Sensor::Battery => "battery",
     }
 }
 

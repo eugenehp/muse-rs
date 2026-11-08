@@ -1,6 +1,6 @@
 [package]
 name          = "muse-rs"
-version       = "0.2.2"
+version       = "0.2.3"
 edition       = "2021"
 # webbluetooth requires it, so this crate does too — declared rather than
 # discovered halfway through a build.
@@ -19,9 +19,6 @@ homepage      = "https://github.com/eugenehp/muse-rs"
 repository    = "https://github.com/eugenehp/muse-rs"
 documentation = "https://docs.rs/muse-rs"
 
-# ── Library target ────────────────────────────────────────────────────────────
-# Produces `libmuse_rs.rlib` (and .so / .dylib for cdylib users).
-# Downstream crates depend on this target; the TUI binaries below are separate.
 
 [lib]
 name = "muse_rs"

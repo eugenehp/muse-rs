@@ -1,7 +1,7 @@
 //! # muse-rs
 //!
 //! Async Rust library and terminal UI for streaming EEG data from
-//! [Interaxon Muse](https://choosemuse.com/) headsets over Bluetooth Low Energy.
+//! [Muse](https://choosemuse.com/) headsets over Bluetooth Low Energy.
 //!
 //! ## Supported hardware
 //!
@@ -105,8 +105,8 @@ pub mod prelude {
 
     // ── Events and data types ─────────────────────────────────────────────────
     pub use crate::types::{
-        ControlResponse, EegReading, EegSample, ImuData, MuseEvent, PpgReading, TelemetryData,
-        XyzSample,
+        ControlResponse, DataGap, DrlRefData, EegReading, EegSample, ImuData, MuseEvent,
+        PpgReading, Sensor, TelemetryData, XyzSample,
     };
 
     // ── Protocol constants ────────────────────────────────────────────────────
