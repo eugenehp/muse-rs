@@ -166,10 +166,10 @@ Use `muse-rs` as a library in your own project:
 # Cargo.toml
 
 # Full build (includes TUI feature):
-muse-rs = "0.2.2"
+muse-rs = "0.2.4"
 
 # Library only — skips ratatui / crossterm compilation:
-muse-rs = { version = "0.2.2", default-features = false }
+muse-rs = { version = "0.2.4", default-features = false }
 ```
 
 ```rust
@@ -697,7 +697,7 @@ If you use `muse-rs` in academic research or published work, please cite it as:
   title        = {muse-rs: Rust Library and TUI for Muse EEG Headsets},
   year         = {2026},
   url          = {https://github.com/eugenehp/muse-rs},
-  version      = {0.2.0},
+  version      = {0.2.4},
   description  = {Async Rust library and terminal UI for streaming real-time
                   EEG, PPG, IMU, and battery data from Muse headsets
                   over Bluetooth Low Energy. Supports Classic and Athena
@@ -707,7 +707,7 @@ If you use `muse-rs` in academic research or published work, please cite it as:
 
 ### APA
 
-> Hauptmann, E. (2026). *muse-rs: Rust Library and TUI for Muse EEG Headsets* (Version 0.2.0) [Computer software]. https://github.com/eugenehp/muse-rs
+> Hauptmann, E. (2026). *muse-rs: Rust Library and TUI for Muse EEG Headsets* (Version 0.2.4) [Computer software]. https://github.com/eugenehp/muse-rs
 
 ### IEEE
 

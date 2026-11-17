@@ -88,7 +88,9 @@ pub fn decode_eeg_samples(data: &[u8]) -> Vec<f64> {
 ///
 /// Returns one `u32` per complete 3-byte group; partial trailing bytes are ignored.
 pub fn decode_unsigned_24bit(data: &[u8]) -> Vec<u32> {
-    data.chunks_exact(3)
+    data.as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32))
         .collect()
 }
@@ -566,8 +568,10 @@ fn decode_athena_subpacket(sp: &Subpacket<'_>, events: &mut Vec<MuseEvent>) {
         // followed by gyroscope xyz, interleaved per sample.
         0x47 => {
             let vals: Vec<i16> = payload
-                .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| i16::from_le_bytes(c))
                 .collect();
             const AS: f32 = 0.0000610352;
             const GS: f32 = -0.0074768;
@@ -596,12 +600,14 @@ fn decode_athena_subpacket(sp: &Subpacket<'_>, events: &mut Vec<MuseEvent>) {
         // See `DrlRefData` for how the layout was established.
         0x53 => {
             let vals: Vec<u16> = payload
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_le_bytes(c))
                 .collect();
             events.push(MuseEvent::DrlRef(DrlRefData {
                 index,
-                samples: vals.chunks_exact(2).map(|p| [p[0], p[1]]).collect(),
+                samples: vals.as_chunks::<2>().0.to_vec(),
             }));
         }
 

@@ -841,14 +841,13 @@ dependencies = [
 
 [[package]]
 name = "muse-rs"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "crossterm",
  "env_logger",
  "log",
  "ratatui",
- "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -1847,9 +1846,9 @@ dependencies = [
 
 [[package]]
 name = "webbluetooth"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4502750f466fa28daf4f03fad699c1edba31f349f2b3fdba68c64d55225442bf"
+checksum = "3d7b246a78f5d5fc9b935533d7f86574e1ab5a406b74d80b629a28fb8fa6f281"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -1864,9 +1863,9 @@ dependencies = [
 
 [[package]]
 name = "webbluetooth-android"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ccb46f769fb35848c067069aee646328dca379380df373d1a7f8c56dd8fa562"
+checksum = "df869cdd36c625d2d59f27e4c20782e78e9c551455e1423b57182309c6610b45"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -1876,9 +1875,9 @@ dependencies = [
 
 [[package]]
 name = "webbluetooth-apple"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d676f3300b258b33f8a0fe70215ca7ce16704ebb547df2fc0581acd51d888723"
+checksum = "0197cc71970640971e0a497c6565cd38f0a6694464de5028f3ef98972d3c7726"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -1888,9 +1887,9 @@ dependencies = [
 
 [[package]]
 name = "webbluetooth-core"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98eba583230172e2be2c3859bcc81888b8eea82741618ba54c58207b26e17998"
+checksum = "aa2e3e1f225b65aa2fda2082f872687e38af31b21dd65d70248498bfb8654911"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -1900,9 +1899,9 @@ dependencies = [
 
 [[package]]
 name = "webbluetooth-linux"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2045179eec49db3137f26f62bcdb42d387d53515eb0be14a64bee7e8a4d2f667"
+checksum = "129aab010cdf53ac81fee2126ad2d18031cc356c368aefb14c65b0cc65db5487"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -1913,18 +1912,18 @@ dependencies = [
 
 [[package]]
 name = "webbluetooth-wasm"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ab6a6dd96032dcd1731e0d78647d85ec39c92fe6a4dfe37505cc23011b8f5b4"
+checksum = "7717b6367274ac27c5c30a6aab2681539e7b77a0ab2ca6cbfca12246699a521e"
 dependencies = [
  "webbluetooth-core",
 ]
 
 [[package]]
 name = "webbluetooth-windows"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abb6e09806062b2505cbae6c159a2489312ccd3fa5fc4411b49b1d64b677fbb4"
+checksum = "dcca14b89dd4be310823403de0230bbc898bdca87c88097749081a718c69eff7"
 dependencies = [
  "futures-channel",
  "futures-core",

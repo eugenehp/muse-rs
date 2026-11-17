@@ -1,4 +1,17 @@
-# Unreleased
+# v0.2.4 — 2026-11-17
+
+`webbluetooth` 0.0.4 → 0.0.5. The public API is unchanged.
+
+## Changed
+
+- **`webbluetooth` and `webbluetooth-wasm` 0.0.5.** On Apple platforms a
+  write without response could wait for ever for CoreBluetooth to report it
+  ready, a few times in a thousand writes; 0.0.5 bounds that wait at 250 ms.
+  Every headset command goes out as a write without response, so a `start`,
+  `pause` or `resume` on macOS or iOS can no longer hang there.
+- The unused `serde` dependency is dropped; `serde_json` stays.
+
+# v0.2.3 — 2026-11-07
 
 ## Fixed
 
@@ -24,12 +37,12 @@
   in samples per channel. `parse::AthenaDecoder` is the stateful decoder that
   finds them; `parse_athena_notification` stays stateless.
 - **`MuseEvent::DrlRef`** — the DRL/REF electrode levels (tag `0x53`), which
-  were skipped. Two channels × six samples of `u16` LE, the layout
-  declares and real data confirms; raw values, since the units are not known.
+  were skipped. Two channels × six samples of `u16` LE, as real data
+  confirms; raw values, since the units are not known.
 - **Athena counters in `index` / `sequence_id`.** Previously always `0`.
 - **`MuseHandle::command`** — sends a command and waits for the headset's
   reply. Every command is answered with JSON carrying `rc`, now readable as
-  `ControlResponse::rc()`. Commands are taken one at a time, as does.
+  `ControlResponse::rc()`. Commands are taken one at a time.
 - **`MAX_COMMAND_LEN`** — `send_command` refuses commands longer than the
   18 bytes a single control write carries, rather than send a frame the
   headset truncates.
